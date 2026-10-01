@@ -38,9 +38,10 @@ Everything that changes a survey is a **dry run unless `apply=true`**.
 
 | Group | Tools |
 |---|---|
-| Read | `list_sites`, `list_surveys`, `get_survey`, `find_elements`, `get_element`, `survey_summary`, `survey_gaps`, `list_palette`, `list_profiles` (presets), `find_products`, `render_plan` (draws real icon colors), `download_floorplan`, `export_elements` (equipment schedule CSV), `raw_get` |
-| Change a survey | `assign_models`, `set_colors`, `set_attributes`, `rename_elements`, `place_elements`, `move_elements`, `delete_elements` |
-| BOM and quote | `load_bom`, `match_parts`, `match_bom`, `bom`, `bom_diff` (BOM vs survey by model), `quote`, `propose_placement`, `apply_placement` |
+| Read | `list_sites`, `list_surveys`, `get_survey`, `find_elements`, `get_element`, `survey_summary`, `survey_gaps`, `list_palette`, `list_profiles` (presets), `find_products`, `render_plan` (draws real icon colors), `download_floorplan`, `export_elements` (equipment schedule CSV), `survey_diff` (A vs B, or vs a backup snapshot), `recent_changes` (which surveys changed since a time), `raw_get` |
+| Change a survey | `assign_models`, `set_colors`, `set_attributes`, `rename_elements`, `place_elements`, `move_elements`, `delete_elements`, `add_cable_path`, `set_cable_path`, `copy_elements` (between your own surveys), `import_price_book` (CSV prices into one survey), `rename_survey` |
+| Survey-level | `duplicate_survey` (native copy for versioning), `replace_floorplan` (new background image, elements kept; old image saved first), `my_parts` (personal parts catalog, merged into `find_products`) |
+| BOM and quote | `load_bom`, `match_parts`, `match_bom`, `bom`, `bom_diff` (BOM vs survey by model), `quote`, `export_quote_pdf` (DRAFT-stamped customer PDF), `propose_placement`, `apply_placement` |
 | Safety and ops | `status`, `list_backups`, `restore_backup` |
 
 Highlights:
@@ -66,6 +67,8 @@ All writes go through one function, `_commit()` in `server.py`:
 10. **Undo.** `restore_backup` puts a snapshot back (also dry-run first, also guarded and snapshotted).
 
 Selection tools (`set_colors`, `set_attributes`, `assign_models`) refuse to run without a scope (ids, element type, name prefix or model) so "change everything" can't happen by accident. Elements can be named by uuid or ID (`FCAM-001`); an unknown or duplicated name is an error, never skipped silently. `move_elements` refuses cable paths (lines) and validates coordinates, `delete_elements` refuses to leave a cable path dangling, `place_elements` refuses name collisions, and the element ID (attributes 141/140) can only change through `rename_elements`. In server mode, file arguments are confined to the data folder and download links are limited to PNG/JPG/XLSX/CSV.
+
+Two deliberate limits: the team's shared product presets are **never** written (they belong to everyone on the team; `my_parts` is a personal catalog instead), and `export_quote_pdf` is stamped DRAFT and refuses to render while devices have no model or price, because the real customer document should come from your CPQ.
 
 The agent endpoint requires `Authorization: Bearer $MCP_TOKEN`. File links returned by the server (quotes, floor plan PNGs) are HMAC-signed with that token and expire after 24 hours.
 
@@ -146,6 +149,7 @@ Notes for anyone extending this, because none of it is documented:
   | 531 | quantity | 167 | mount height |
   | 533 | install hours | 524, 521, 526 | cable length, extra length, type |
 
+- **More hosts and endpoints.** Floor-plan images live on `resources.openapi.systemsurveyor.com` (`GET`/`POST /survey/{id}/floorplan`, same Bearer token). `POST /survey/{id}/copy` on the read host duplicates a survey server-side (returns a job id; poll `/survey/{id}/copy/{job}/status`). A cable path is an element with `variant: polyline`, two points and `connections` (`start`/`end` with an `attachment_point` of L/R/T/B); its length is pixel distance times `floorplan_scale`.
 - **Presets** ("element profiles") are per team. A preset copies product specs onto an element, which is why `assign_models` excludes surveyed attributes by default: applying a preset naively overwrites the measured mount height and coverage angle.
 - **Element types** are numeric (`69` fixed camera, `257` multi-lens camera, `65` cable path, ...). `list_palette` shows your team's list.
 

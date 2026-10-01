@@ -5,6 +5,7 @@ import httpx
 
 BASE = "https://openapi2.systemsurveyor.com/v3"
 WBASE = "https://openapi.systemsurveyor.com/v3"
+RBASE = "https://resources.openapi.systemsurveyor.com"
 TOKEN_FILE = Path(os.environ.get("SS_TOKEN_FILE", Path.home() / ".systemsurveyor" / "tokens.json"))
 
 DROP_KEYS = {"photo_urls", "pdf_urls", "attributeHash", "sections", "group", "icon", "floorplan_url"}
@@ -131,7 +132,8 @@ class Client:
                 attrs = {}
                 for sec in c.get("sections", []):
                     for a in sec.get("attributes", []) or []:
-                        attrs[a["attribute_id"]] = {"name": a["name"], "default": a.get("default_value") or ""}
+                        attrs[a["attribute_id"]] = {"name": a["name"], "default": a.get("default_value") or "",
+                                                    "options": [v["value"] for v in (a.get("values") or []) if isinstance(v, dict) and "value" in v]}
                         names[a["attribute_id"]] = a["name"]
                 st = c.get("systemType") or {}
                 out[c["element_id"]] = {
@@ -198,6 +200,22 @@ class Client:
     def survey(self, survey_id):
         j = self.get(f"/survey/{survey_id}")
         return j if "elements" in j else j.get("data", j)
+
+    # ---- survey copy / floor plan ----
+    def copy_survey(self, survey_id):
+        """Server-side duplicate into the same site. Returns the job id (poll copy_status)."""
+        j = self.req("POST", f"/survey/{survey_id}/copy").json()
+        return j.get("job_id") or (j.get("data") or {}).get("job_id")
+
+    def copy_status(self, survey_id, job):
+        return self.req("GET", f"/survey/{survey_id}/copy/{job}/status").json()
+
+    def floorplan_bytes(self, survey_id):
+        return self.req("GET", f"/survey/{survey_id}/floorplan", base=RBASE).content
+
+    def upload_floorplan(self, survey_id, data, name, ctype):
+        r = self.req("POST", f"/survey/{survey_id}/floorplan", base=RBASE, files={"floorplan": (name, data, ctype)})
+        return r.json() if r.content else {}
 
     # ---- write path ----
     @staticmethod

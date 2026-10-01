@@ -1,5 +1,5 @@
 """System Surveyor MCP server. Writes are dry-run unless apply=true."""
-import base64, collections, csv, functools, hashlib, hmac, json, math, os, re, sys, threading, time
+import base64, collections, concurrent.futures, copy, csv, datetime, functools, hashlib, hmac, io, json, math, os, re, sys, threading, time, uuid
 from pathlib import Path
 import httpx
 from mcp.server.fastmcp import FastMCP
@@ -18,6 +18,8 @@ Typical jobs:
 Every change tool is a dry run unless apply=true. Writes are refused unless the server has them enabled AND the survey is on its allowlist, and are capped per save. Rules for you: never call apply=true until you have shown the dry-run list to the user and they said yes in this conversation; if anything is ambiguous (which model, indoor/outdoor, where a part goes, duplicate names, a price that might be cost vs list) ask first, never guess; change only what was asked and only the survey named; never delete unless explicitly told. Each save takes a snapshot first, then re-reads the survey and reports verified true/false; if anything is off, restore_backup undoes it (call list_backups). Writes only work on the owner's own surveys (or ones he allowlisted), max 40 elements per save. Call status if something fails. Tools for changing a survey: assign_models (model/manufacturer/price; copy_specs=true also copies product specs but never the surveyed mount height/coverage/frame rates), rename_elements (fix_duplicates=true numbers duplicates correctly), place_elements, move_elements, delete_elements (only when told to), restore_backup.
 Colors: set_colors changes icon colors (and coverage/field-of-view colors, including each lens of a multi-lens camera) without touching surveyed geometry - ask the user which scheme (one color for everything, by model, by type, by status, by system, or per-lens colors) and show the color_map from the dry run before applying. set_attributes sets any attribute on a group (status, description, mount height) with old values shown. survey_summary gives a quick overview. BOM placement: when the user gives a BOM (or a Salesforce quote), call propose_placement, show the plan and ASK the user every question it returns (never choose locations yourself), use render_plan with the proposed points so they can confirm spots, then apply_placement dry run, yes, apply. Prefer assigning BOM parts to existing blank elements over adding new ones.
 Looking things up: find_elements (search/filter a survey), get_element (every attribute of one), bom_diff (a Salesforce BOM vs what the survey says, by model), export_elements (equipment schedule CSV). Elements can be named by uuid or by ID like FCAM-001; an unknown or duplicated name is an error, never a guess. Cable paths are never moved or deleted by accident: move_elements refuses lines, delete_elements refuses to leave a cable dangling. The server itself counts what a save really changes and refuses oversized saves, and refuses any save that removes elements unless it is delete_elements or restore_backup.
+Survey-level tools: rename_survey (title; read the exact Salesforce opportunity name first), duplicate_survey (server-side copy for versioning), replace_floorplan (new background image, elements kept; image must be the same pixel size), survey_diff (A vs B, or vs a 'backup:<file>'), recent_changes (which surveys changed since a time), copy_elements (between the user's own surveys), add_cable_path / set_cable_path (cable runs with type and length), import_price_book (CSV prices into ONE survey - ask whether they are cost or list, because quote treats survey prices as cost and adds markup), export_quote_pdf (a DRAFT-stamped customer PDF; the real quote is Salesforce CPQ). my_parts keeps a personal parts list; the team's shared presets are never written by this server because they belong to everyone.
+Survey -> Salesforce recipe (Salesforce stays read-only here): the user names the opportunity -> salesforce_query for its exact name -> rename_survey (dry run, yes, apply) -> bom -> cpq_match_parts -> cpq_preview_changes -> user confirms -> cpq_add_lines. Use Salesforce CPQ list/sell prices for the quote, not the survey's device price.
 Unknown values stay unknown: report gaps, do not invent prices or model numbers."""
 
 mcp = FastMCP("systemsurveyor", instructions=INSTRUCTIONS, host="0.0.0.0", port=int(os.environ.get("PORT", 8797)),
@@ -67,6 +69,30 @@ def _diff(old, new):
     return {"changed": changed, "added": [i for i in b if i not in a], "removed": [i for i in a if i not in b]}
 
 
+def _meta(old, new):
+    """Survey-level fields a tool may change (just the title)."""
+    return [k for k in ("title",) if new.get(k) is not None and (old.get(k) or "") != (new.get(k) or "")]
+
+
+def _gate(live):
+    """Why a write that does not go through _commit (floor plan swap) must not happen, or None."""
+    if not WRITES:
+        return "Writes are switched off on this server (ALLOW_WRITES=false). Nothing was changed."
+    why = _may_write(live)
+    if why:
+        return why
+    ed = live.get("editor")
+    ed = ed.get("user_id") if isinstance(ed, dict) else ed
+    if ed not in (None, "", 0) and OWNER_USER_ID and ed != OWNER_USER_ID:
+        return f"someone else (user {ed}) has this survey claimed for editing. Nothing changed."
+    return None
+
+
+def _journal(tool, survey, title, **kw):
+    with open(OUT / "journal.jsonl", "a") as f:
+        f.write(json.dumps({"t": time.strftime("%Y%m%d-%H%M%S"), "tool": tool, "survey": survey, "title": title, **kw}) + "\n")
+
+
 def _nm(doc, i):
     for e in doc.get("elements", []):
         if e["id"] == i:
@@ -82,6 +108,8 @@ def _verify(d, live):
     for i, e in want.items():
         if i in got and (_norm_attrs(e) != _norm_attrs(got[i]) or _pos(e) != _pos(got[i])):
             bad.append(i)
+    if d.get("title") is not None and (live.get("title") or "") != (d.get("title") or ""):
+        bad.append("title")
     return {"ok": not bad, "mismatched_ids": bad[:10], "elements": len(got)}
 
 
@@ -100,7 +128,8 @@ def _commit(d, tool, extra, force_count=None):
         if live.get("version") != d.get("version"):
             return {"saved": False, "error": "survey changed while working; re-read and redo"}
         df = _diff(live, d)
-        actual = len(df["changed"]) + len(df["added"]) + len(df["removed"])
+        meta = _meta(live, d)
+        actual = len(df["changed"]) + len(df["added"]) + len(df["removed"]) + len(meta)
         n = max(n, actual)
         if actual == 0:
             return {"saved": False, "note": "nothing would change (already as requested). No save was made."}
@@ -123,8 +152,8 @@ def _commit(d, tool, extra, force_count=None):
         ver = _verify(d, after)
         with open(OUT / "journal.jsonl", "a") as f:
             f.write(json.dumps({"t": stamp, "tool": tool, "survey": d["id"], "title": d.get("title"), "n": n, "verified": ver["ok"],
-                                "changed": [_nm(live, i) for i in df["changed"]][:60], "added": len(df["added"]), "removed": [_nm(live, i) for i in df["removed"]][:60]}) + "\n")
-        out = {"saved": True, **extra, "actual_changes": {k: len(v) for k, v in df.items()}, "backup": f"{d['id']}-{stamp}.json", "verified": ver}
+                                "changed": [_nm(live, i) for i in df["changed"]][:60], "added": len(df["added"]), "removed": [_nm(live, i) for i in df["removed"]][:60], "meta": meta}) + "\n")
+        out = {"saved": True, **extra, "actual_changes": {**{k: len(v) for k, v in df.items()}, **({"title": 1} if meta else {})}, "backup": f"{d['id']}-{stamp}.json", "verified": ver}
         if not ver["ok"]:
             out["warning"] = "saved, but the re-read does not match what was sent. Check the survey; the backup can restore it (restore_backup)."
         return out
@@ -311,6 +340,14 @@ def find_products(query: str, element_id: int = 0, limit: int = 15) -> list:
             s += 10
         if s:
             scored.append((s, row))
+    for m in _mine_load():
+        if element_id and m.get("element_id") and m["element_id"] != element_id:
+            continue
+        hay = f'{m["manufacturer"]} {m["model"]} {m.get("description", "")}'.lower()
+        s = sum(1 for t in toks if t in hay) + (10 if nq and Q.norm(m["model"]) == nq else 0)
+        if s:
+            scored.append((s, {"profile_id": None, "source": "my_parts", "name": m["model"], "element_id": m.get("element_id") or None,
+                               "manufacturer": m["manufacturer"], "model": m["model"], "price": m.get("price"), "description": m.get("description", "")}))
     scored.sort(key=lambda x: -x[0])
     return [r for _, r in scored[:limit]]
 
@@ -969,6 +1006,584 @@ def quote(survey_id: str, pricebook_path: str = "", labor_rate: float = DEF_LABO
     return q
 
 
+# ---------------- personal parts catalog (never touches shared team presets) ----------------
+_MINE = OUT / "my_parts.json"
+_mlock = threading.Lock()
+
+
+def _mine_load():
+    try:
+        return json.loads(_MINE.read_text()).get("parts", [])
+    except Exception:
+        return []
+
+
+@mcp.tool()
+@_guard
+def my_parts(action: str = "list", manufacturer: str = "", model: str = "", price: float = -1, description: str = "", element_id: int = 0) -> dict:
+    """The user's PERSONAL parts catalog on this server (manufacturer, model, price) - a place to keep matched parts for reuse. It does NOT change the team's shared System Surveyor presets (those belong to everyone, so this server never writes them). Parts saved here show up in find_products (source "my_parts") and can be applied to a survey with assign_models(manufacturer=, model=, price=).
+    action: "list", "save" (manufacturer + model required; price/description/element_id optional; same model replaces the old row) or "delete" (by model). Only touches a small file on the server, never a survey."""
+    act = action.lower()
+    with _mlock:
+        parts = _mine_load()
+        if act == "list":
+            return {"count": len(parts), "parts": parts}
+        if not model.strip():
+            return {"error": "model is required"}
+        key = Q.norm(model)
+        if act == "delete":
+            keep = [p for p in parts if Q.norm(p["model"]) != key]
+            if len(keep) == len(parts):
+                return {"error": f"no saved part with model {model}"}
+            _MINE.write_text(json.dumps({"parts": keep}, indent=1))
+            return {"deleted": model, "count": len(keep)}
+        if act != "save":
+            return {"error": "action must be list, save or delete"}
+        if not manufacturer.strip():
+            return {"error": "manufacturer is required"}
+        if price != -1 and (not math.isfinite(price) or price < 0 or price > 1_000_000):
+            return {"error": "price must be between 0 and 1,000,000 (leave it out if unknown)"}
+        if len(parts) >= 2000 and not any(Q.norm(p["model"]) == key for p in parts):
+            return {"error": "personal catalog is full (2000 parts)"}
+        row = {"manufacturer": manufacturer.strip()[:80], "model": model.strip()[:80], "price": None if price == -1 else round(price, 2),
+               "description": description.strip()[:300], "element_id": element_id or None, "saved": time.strftime("%Y-%m-%d")}
+        parts = [p for p in parts if Q.norm(p["model"]) != key] + [row]
+        _MINE.write_text(json.dumps({"parts": parts}, indent=1))
+        return {"saved": row, "count": len(parts)}
+
+
+# ---------------- survey-level: rename / duplicate / floor plan / diff / changes ----------------
+def _title_ok(t):
+    t = (t or "").strip()
+    if not t or len(t) > 200 or any(ord(c) < 32 for c in t):
+        raise SSError("title must be 1-200 characters with no control characters")
+    return t
+
+
+@mcp.tool()
+@_guard
+def rename_survey(survey_id: str, title: str, apply: bool = False) -> dict:
+    """Change a survey's title (e.g. to match the Salesforce opportunity name - read the exact name from Salesforce first, never type it from memory). Own surveys only. Dry run unless apply=true; restore_backup undoes it."""
+    d = C.survey(survey_id)
+    new = _title_ok(title)
+    info = {"title_was": d.get("title"), "title_will_be": new}
+    if (d.get("title") or "") == new:
+        return {"note": "the survey already has that title", **info}
+    d["title"] = new
+    if not apply:
+        return {"dry_run": True, **info}
+    return _commit(d, "rename_survey", info, force_count=1)
+
+
+@mcp.tool()
+@_guard
+def duplicate_survey(survey_id: str, new_title: str = "", apply: bool = False) -> dict:
+    """Make a copy of a survey (same site, same floor plan, all elements) for versioning before edits, using System Surveyor's own copy function. The original is never touched. The copy is a new survey owned by the user, so it can be edited like any of their own surveys. new_title defaults to '<title> - copy <date>'. Dry run unless apply=true."""
+    d = C.survey(survey_id)
+    if d.get("team_id") != C.team_id():
+        return {"error": f"that survey belongs to team {d.get('team_id')}, not this server's team; it will not be copied"}
+    site_id = d["site"]["id"] if isinstance(d.get("site"), dict) else d.get("site")
+    title = _title_ok(new_title) if new_title.strip() else f"{d.get('title')} - copy {time.strftime('%Y-%m-%d')}"[:200]
+    info = {"source": d.get("title"), "elements": len(d.get("elements", [])), "new_title": title, "same_site": site_id}
+    if not apply:
+        return {"dry_run": True, **info, "note": "creates one new survey in the same site; the original is not changed"}
+    if not WRITES:
+        return {"saved": False, "blocked": "Writes are switched off on this server (ALLOW_WRITES=false). Nothing was created."}
+    with _wlock:
+        before = {x["id"] for x in C.surveys(site_id)}
+        job = C.copy_survey(survey_id)
+        if not job:
+            return {"error": "System Surveyor did not start a copy job; nothing was created (check the site for a stray copy)"}
+        res = {}
+        for _ in range(60):
+            time.sleep(2)
+            res = C.copy_status(survey_id, job)
+            st = str(res.get("status") or "").lower()
+            if st in ("completed", "complete", "success", "succeeded", "done"):
+                break
+            if st in ("failed", "error", "errored"):
+                return {"error": f"System Surveyor's copy failed: {res.get('message') or res}"}
+        else:
+            return {"error": "the copy is still running after 2 minutes; check the site for the new survey before trying again (so you do not make two)"}
+        new = [x for x in C.surveys(site_id) if x["id"] not in before]
+        if len(new) != 1:
+            return {"error": f"copy finished but {len(new)} new surveys appeared in the site, so I will not guess which is yours: {[(x['id'], x.get('title')) for x in new]}"}
+    nid = new[0]["id"]
+    _journal("duplicate_survey", nid, title, copied_from=survey_id, n=len(d.get("elements", [])))
+    out = {"saved": True, "new_survey_id": nid, "copied_from": survey_id, **info}
+    nd = C.survey(nid)
+    if (nd.get("title") or "") != title:
+        was = nd.get("title")
+        nd["title"] = title
+        r = _commit(nd, "rename_survey", {"title_was": was, "title_will_be": title}, force_count=1)
+        out["rename"] = {k: r.get(k) for k in ("saved", "blocked", "error", "verified") if k in r}
+    out["elements_in_copy"] = len(C.survey(nid).get("elements", []))
+    return out
+
+
+def _img_info(b):
+    from PIL import Image
+    try:
+        im = Image.open(io.BytesIO(b))
+        w, h = im.size
+        return im.format, w, h
+    except Exception:
+        raise SSError("that file is not a readable image (use PNG or JPG)")
+
+
+@mcp.tool()
+@_guard
+def replace_floorplan(survey_id: str, image_path: str = "", image_base64: str = "", allow_size_change: bool = False, apply: bool = False) -> dict:
+    """Swap the background floor-plan image of one of the user's own surveys, keeping every element exactly where it is (positions are plan pixels, so a new image should have the same pixel size - otherwise elements land in the wrong place; a size change is refused unless allow_size_change=true). Give the image as image_path (a PNG/JPG inside the server data folder) or image_base64. The old image is saved first to the data folder (backups/floorplan-<id>-<time>.png/jpg); to undo, run replace_floorplan again with that file as image_path. Dry run unless apply=true."""
+    d = C.survey(survey_id)
+    if image_path:
+        raw = _confine(image_path).read_bytes()
+    elif image_base64:
+        raw = base64.b64decode(image_base64.split(",")[-1], validate=False)
+    else:
+        return {"error": "give image_path (a file inside the data folder) or image_base64"}
+    if len(raw) > 15_000_000:
+        return {"error": "image is over 15 MB"}
+    fmt, w, h = _img_info(raw)
+    if fmt not in ("PNG", "JPEG"):
+        return {"error": f"image must be PNG or JPG, got {fmt}"}
+    if w > 12000 or h > 12000:
+        return {"error": f"image is {w}x{h}; the limit is 12000 px per side"}
+    old = C.floorplan_bytes(survey_id)
+    ofmt, ow, oh = _img_info(old)
+    info = {"survey": d.get("title"), "elements_kept": len(d.get("elements", [])), "current_plan_px": [ow, oh], "new_plan_px": [w, h], "new_kb": len(raw) // 1024}
+    same = (ow, oh) == (w, h)
+    if not same:
+        info["warning"] = "the new image is a different pixel size; elements keep their pixel positions and will not line up with the new drawing unless allow_size_change=true is a deliberate choice"
+    if not apply:
+        return {"dry_run": True, **info}
+    why = _gate(d)
+    if why:
+        return {"saved": False, "blocked": why}
+    if not same and not allow_size_change:
+        return {"saved": False, "blocked": "image size differs from the current plan; pass allow_size_change=true if that is intended", **info}
+    with _wlock:
+        live = C.survey(survey_id)
+        if live.get("version") != d.get("version"):
+            return {"saved": False, "error": "survey changed while working; re-read and redo"}
+        bk = OUT / "backups"
+        bk.mkdir(exist_ok=True)
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        keep = bk / f"floorplan-{survey_id}-{stamp}.{'png' if ofmt == 'PNG' else 'jpg'}"
+        keep.write_bytes(old)
+        C.upload_floorplan(survey_id, raw, "floorplan." + ("png" if fmt == "PNG" else "jpg"), "image/png" if fmt == "PNG" else "image/jpeg")
+        got = _img_info(C.floorplan_bytes(survey_id))
+    ok = (got[1], got[2]) == (w, h)
+    _journal("replace_floorplan", survey_id, d.get("title"), old_px=[ow, oh], new_px=[w, h], verified=ok)
+    return {"saved": True, **info, "old_image_saved_as": keep.name, "verified": {"ok": ok, "plan_px_now": [got[1], got[2]]},
+            "undo": f"replace_floorplan(survey_id, image_path='{keep}', apply=true)"}
+
+
+def _load_doc(ref):
+    if ref.startswith("backup:"):
+        p = OUT / "backups" / Path(ref[7:]).name
+        if not p.is_file():
+            raise SSError(f"no backup named {ref[7:]} (use list_backups)")
+        return json.loads(p.read_text())
+    return C.survey(ref)
+
+
+def _keyed(d):
+    out, seen = {}, collections.Counter()
+    for e in d.get("elements", []):
+        k = str(_a(e, 141) or e.get("name") or e["id"])
+        seen[k] += 1
+        out[k if seen[k] == 1 else f"{k}#{seen[k]}"] = e
+    return out
+
+
+@mcp.tool()
+@_guard
+def survey_diff(survey_a_id: str, survey_b_id: str, limit: int = 60) -> dict:
+    """Compare two surveys (or a survey with a snapshot: pass 'backup:<file from list_backups>') and list what was added, removed and changed going from A to B, with before/after values for each attribute and moves in plan pixels. Elements are matched by their ID (FCAM-001), so it works between a survey and its copy. Use it for 'what changed between versions'. Read-only."""
+    A, B = _load_doc(survey_a_id), _load_doc(survey_b_id)
+    ka, kb = _keyed(A), _keyed(B)
+    ida = {e["id"]: k for k, e in ka.items()}
+    idb = {e["id"]: k for k, e in kb.items()}
+    pal = _pal()
+
+    def tname(e):
+        return pal.get(e.get("element_id"), {}).get("name", e.get("element_id"))
+
+    def conn(e, names):
+        return {side: names.get(((e.get("connections") or {}).get(side) or {}).get("id")) for side in ("start", "end")} if e.get("connections") else None
+
+    # pair by internal uuid first (same survey/snapshot), then by ID text (a copy or a rebuilt survey)
+    pairs = {ka_: kb_ for ka_, kb_ in ((ida[u], idb[u]) for u in ida if u in idb)}
+    left_a = [k for k in ka if k not in pairs]
+    taken = set(pairs.values())
+    for k in left_a:
+        base = k.split("#")[0]
+        if k in kb and k not in taken:
+            pairs[k] = k
+            taken.add(k)
+        elif base in kb and base not in taken:
+            pairs[k] = base
+            taken.add(base)
+    changed = []
+    for k, k2 in pairs.items():
+        x, y = ka[k], kb[k2]
+        ax, ay = _norm_attrs(x), _norm_attrs(y)
+        ch = {f"{i} {C.attr_name(i)}": {"before": ax.get(i), "after": ay.get(i)} for i in sorted(set(ax) | set(ay)) if ax.get(i, "") != ay.get(i, "")}
+        row = {"id": k2 if k == k2 else f"{k} -> {k2}", "type": tname(y)}
+        if ch:
+            row["attributes"] = ch
+        px, py = x.get("position"), y.get("position")
+        if isinstance(px, dict) and isinstance(py, dict):
+            if math.hypot(px["x"] - py["x"], px["y"] - py["y"]) > 0.5:
+                row["moved"] = {"from": [round(px["x"], 1), round(px["y"], 1)], "to": [round(py["x"], 1), round(py["y"], 1)]}
+        elif _pos(x) != _pos(y):
+            row["route_changed"] = True
+        if conn(x, ida) != conn(y, idb):
+            row["connections"] = {"before": conn(x, ida), "after": conn(y, idb)}
+        if len(row) > 2:
+            changed.append(row)
+    added = [{"id": k, "type": tname(e), "model": _a(e, 305)} for k, e in kb.items() if k not in taken]
+    removed = [{"id": k, "type": tname(e), "model": _a(e, 305)} for k, e in ka.items() if k not in pairs]
+    meta = {f: {"before": A.get(f), "after": B.get(f)} for f in ("title", "floorplan_scale", "unit", "icon_size") if A.get(f) != B.get(f)}
+    return {"a": A.get("title"), "b": B.get("title"), "survey_fields_changed": meta,
+            "counts": {"added": len(added), "removed": len(removed), "changed": len(changed), "unchanged": len(ka) - len(removed) - len(changed)},
+            "added": added[:limit], "removed": removed[:limit], "changed": changed[:limit],
+            "truncated": max(len(added), len(removed), len(changed)) > limit}
+
+
+_RC = {"t": 0, "rows": [], "done": True}
+
+
+def _since(v):
+    v = str(v).strip()
+    try:
+        return float(v)
+    except ValueError:
+        try:
+            dt = datetime.datetime.fromisoformat(v.replace("Z", "+00:00"))
+        except ValueError:
+            raise SSError("since_utc must look like 2026-09-30T12:00:00Z (or epoch seconds)")
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=datetime.timezone.utc)
+        return dt.timestamp()
+
+
+@mcp.tool()
+@_guard
+def recent_changes(since_utc: str, site_id: str = "", favorites_only: bool = False, search: str = "", limit: int = 50) -> dict:
+    """Change feed: which surveys were modified since a time (ISO like 2026-09-30T12:00:00Z, or epoch seconds), newest first, with site, title, element count and who has it claimed for editing; plus what was changed through THIS server (journal). Scans every site in the account unless narrowed with site_id / favorites_only / search, so for a cron watcher pass favorites_only or a search. Results are cached for 5 minutes. To see WHAT changed inside a survey, compare it with survey_diff (against a copy or a 'backup:' snapshot). Read-only."""
+    t0 = _since(since_utc)
+    key = (site_id, favorites_only, search)
+    if _RC.get("key") != key or time.time() - _RC["t"] > 300:
+        sites = [{"id": site_id, "name": ""}] if site_id else C.sites(search or None, favorites_only)
+        if not C.tok.get("token"):
+            C.refresh()
+        rows, done = [], True
+        deadline = time.time() + 100
+
+        def one(st):
+            if time.time() > deadline:
+                return None
+            return [{"site": st["name"], "site_id": st["id"], "survey_id": x["id"], "title": x.get("title"), "elements": x.get("element_count"),
+                     "modified": x.get("modified_at"), "claimed_by": (x.get("editor") or {}).get("first_name") if isinstance(x.get("editor"), dict) else x.get("editor")}
+                    for x in C.surveys(st["id"])]
+
+        with concurrent.futures.ThreadPoolExecutor(6) as ex:
+            for res in ex.map(one, sites):
+                if res is None:
+                    done = False
+                else:
+                    rows += res
+        _RC.update(t=time.time(), rows=rows, done=done, key=key, sites=len(sites))
+    hits = sorted((dict(r) for r in _RC["rows"] if (r["modified"] or 0) >= t0), key=lambda r: -(r["modified"] or 0))
+    for r in hits:
+        r["modified_utc"] = datetime.datetime.fromtimestamp(r["modified"], datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    jr = []
+    try:
+        for ln in (OUT / "journal.jsonl").read_text().splitlines()[-400:]:
+            j = json.loads(ln)
+            tt = datetime.datetime.strptime(j["t"], "%Y%m%d-%H%M%S").timestamp()
+            if tt >= t0:
+                jr.append(j)
+    except Exception:
+        pass
+    return {"since": datetime.datetime.fromtimestamp(t0, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"), "sites_scanned": _RC.get("sites"),
+            "scan_complete": _RC["done"], "surveys_modified": len(hits), "surveys": hits[:limit], "changed_through_this_server": jr[-limit:][::-1],
+            "note": "journal entries use the server's local clock" if jr else ""}
+
+
+# ---------------- cable paths ----------------
+_SIDE = {"L": lambda w: (0, w / 2), "R": lambda w: (w, w / 2), "T": lambda w: (w / 2, 0), "B": lambda w: (w / 2, w)}
+
+
+def _cable_type(v):
+    opts = C.templates()[CABLE]["attrs"].get(526, {}).get("options") or []
+    if not v:
+        return None
+    for o in opts:
+        if o.lower() == v.strip().lower():
+            return o
+    raise SSError(f"cable_type '{v}' is not one of this team's options: {', '.join(opts)}")
+
+
+@mcp.tool()
+@_guard
+def add_cable_path(survey_id: str, from_id: str, to_id: str, cable_type: str = "", length_ft: float = -1, apply: bool = False) -> dict:
+    """Draw a cable run between two devices (uuid or name like WRCV-001), attached to their edges like the web app does, with cable type (one of the team's options, e.g. CAT6) and length. length_ft left out = measured from the drawing (distance x the plan scale; only for imperial plans). Cable paths feed cable_ft in bom/quote. Refuses a duplicate run between the same two devices. Dry run unless apply=true."""
+    d = C.survey(survey_id)
+    if from_id == to_id:
+        return {"error": "from_id and to_id are the same device"}
+    a, b = _resolve(d, [from_id, to_id])
+    if a["id"] == b["id"]:
+        return {"error": "from_id and to_id are the same device"}
+    for e in (a, b):
+        if e.get("element_id") == CABLE or not isinstance(e.get("position"), dict):
+            return {"error": f"{e.get('name')} is not a device with a position (cable paths connect devices)"}
+    for c in d.get("elements", []):
+        if c.get("element_id") == CABLE:
+            ends = {((c.get("connections") or {}).get(x) or {}).get("id") for x in ("start", "end")}
+            if ends == {a["id"], b["id"]}:
+                return {"error": f"{c.get('name')} already connects {a.get('name')} and {b.get('name')}; use set_cable_path to change it"}
+    ctype = _cable_type(cable_type)
+    w = float(d.get("icon_size") or 10) * 0.981
+    pa, pb = a["position"], b["position"]
+    dx, dy = pb["x"] - pa["x"], pb["y"] - pa["y"]
+    sa, sb = (("R", "L") if dx >= 0 else ("L", "R")) if abs(dx) >= abs(dy) else (("B", "T") if dy >= 0 else ("T", "B"))
+    p1 = {"x": round(pa["x"] + _SIDE[sa](w)[0], 2), "y": round(pa["y"] + _SIDE[sa](w)[1], 2)}
+    p2 = {"x": round(pb["x"] + _SIDE[sb](w)[0], 2), "y": round(pb["y"] + _SIDE[sb](w)[1], 2)}
+    if length_ft < 0:
+        if d.get("unit") != "imperial" or not d.get("floorplan_scale"):
+            return {"error": "cannot measure the length on this plan (not imperial or no scale); pass length_ft"}
+        length_ft = round(math.hypot(p2["x"] - p1["x"], p2["y"] - p1["y"]) * float(d["floorplan_scale"]))
+        measured = True
+    else:
+        if not math.isfinite(length_ft) or length_ft > 5000:
+            return {"error": "length_ft must be between 0 and 5000"}
+        measured = False
+    e = C.new_element(d, CABLE, 0, 0, attributes={524: f"{length_ft:g}", **({526: ctype} if ctype else {})})
+    e.update(variant="polyline", position=[p1, p2], connections={"start": {"id": a["id"], "attachment_point": sa}, "end": {"id": b["id"], "attachment_point": sb}})
+    d["elements"].append(e)
+    row = {"name": e["name"], "from": a.get("name"), "to": b.get("name"), "cable_type": ctype or "None", "length_ft": length_ft, "length_measured_from_plan": measured}
+    if not apply:
+        return {"dry_run": True, "would_add": row}
+    return _commit(d, "add_cable_path", {"added": [row]})
+
+
+@mcp.tool()
+@_guard
+def set_cable_path(survey_id: str, path_id: str, cable_type: str = "", length_ft: float = -1, apply: bool = False) -> dict:
+    """Set the cable type (one of the team's options, e.g. CAT6) and/or length in feet on an existing cable path (uuid or name like CP-001). Leaves its drawn route and connections alone. Use survey_gaps to find paths missing a type/length. Dry run unless apply=true."""
+    d = C.survey(survey_id)
+    e = _resolve(d, [path_id])[0]
+    if e.get("element_id") != CABLE:
+        return {"error": f"{e.get('name')} is not a cable path"}
+    ctype = _cable_type(cable_type)
+    if not ctype and length_ft < 0:
+        return {"error": "give cable_type and/or length_ft"}
+    was = {"cable_type": _a(e, 526), "length_ft": _a(e, 524)}
+    if ctype:
+        C.set_attr(e, 526, ctype)
+    if length_ft >= 0:
+        if not math.isfinite(length_ft) or length_ft > 5000:
+            return {"error": "length_ft must be between 0 and 5000"}
+        C.set_attr(e, 524, f"{length_ft:g}")
+    row = {"name": e.get("name"), "was": was, "now": {"cable_type": _a(e, 526), "length_ft": _a(e, 524)}}
+    if not apply:
+        return {"dry_run": True, **row}
+    return _commit(d, "set_cable_path", {"count": 1, **row})
+
+
+# ---------------- copy between surveys / price import ----------------
+@mcp.tool()
+@_guard
+def copy_elements(source_survey_id: str, target_survey_id: str, ids: list[str], dx: float = 0, dy: float = 0, apply: bool = False) -> dict:
+    """Copy elements from one survey into another of the user's own surveys (splitting/merging, e.g. Office vs Cameras). The source is only read. Copies get new internal ids; an ID that already exists in the target gets the next free number. Cable paths copy only if BOTH of their devices are in the copy (their connections are re-pointed to the copies). dx/dy shift the copies in plan pixels (default: same spot, so use it if the two plans are not the same drawing). Max 40 per save. Dry run unless apply=true."""
+    if source_survey_id == target_survey_id:
+        return {"error": "source and target are the same survey"}
+    if not (math.isfinite(dx) and math.isfinite(dy)) or abs(dx) > 50000 or abs(dy) > 50000:
+        return {"error": "dx/dy out of range"}
+    src, tgt = C.survey(source_survey_id), C.survey(target_survey_id)
+    if not ids:
+        return {"error": "ids is empty"}
+    picked = _resolve(src, ids)
+    idset = {e["id"] for e in picked}
+    for e in picked:
+        if e.get("element_id") == CABLE:
+            for side in ("start", "end"):
+                if ((e.get("connections") or {}).get(side) or {}).get("id") not in idset:
+                    return {"error": f"cable path {e.get('name')} connects to a device that is not in the list; add that device too, or leave the cable out"}
+    left_behind = [c.get("name") for c in _cables_touching(src, idset)]
+    new_ids = {e["id"]: str(uuid.uuid4()) for e in picked}
+    used = {str(_a(e, 141) or e.get("name")) for e in tgt.get("elements", [])}
+    rows, made = [], []
+    for e in picked:
+        c = copy.deepcopy(e)
+        c["id"] = new_ids[e["id"]]
+        for k in ("photos", "pdfs", "web_links", "children", "activity_log"):
+            if k in c:
+                c[k] = []
+        old = str(_a(e, 141) or e.get("name"))
+        nm = old if old not in used else C.next_id(tgt, e["element_id"], extra=used)
+        used.add(nm)
+        C.set_attr(c, 141, nm)
+        c["name"] = nm
+        pos = c.get("position")
+        if isinstance(pos, dict):
+            c["position"] = {"x": round(pos["x"] + dx, 2), "y": round(pos["y"] + dy, 2)}
+        elif isinstance(pos, list):
+            c["position"] = [{"x": round(p["x"] + dx, 2), "y": round(p["y"] + dy, 2)} for p in pos]
+        if c.get("connections"):
+            c["connections"] = {k: {**v, "id": new_ids[v["id"]]} for k, v in c["connections"].items()}
+        made.append(c)
+        rows.append({"from": old, "as": nm, "type": _pal().get(e["element_id"], {}).get("name", e["element_id"])})
+    base_idx = max([x.get("element_index", 0) for x in tgt.get("elements", [])] + [0])
+    base_z = max([x.get("z_order", 0) for x in tgt.get("elements", [])] + [0])
+    for i, c in enumerate(made, 1):
+        c["element_index"], c["z_order"] = base_idx + i, base_z + i
+    tgt["elements"] += made
+    info = {"copying": len(rows), "into": tgt.get("title"), "from": src.get("title"), "elements": rows}
+    if left_behind:
+        info["cable_paths_not_copied"] = f"these cables touch the copied devices in the source and were left out: {', '.join(map(str, left_behind[:12]))}"
+    if not apply:
+        return {"dry_run": True, **info}
+    return _commit(tgt, "copy_elements", {"added": rows, **{k: v for k, v in info.items() if k != "elements"}})
+
+
+def _money(v):
+    try:
+        x = float(str(v).replace("$", "").replace(",", "").strip())
+    except ValueError:
+        return None
+    return x if math.isfinite(x) and 0 <= x <= 1_000_000 else None
+
+
+@mcp.tool()
+@_guard
+def import_price_book(csv_text: str, survey_id: str, overwrite: bool = False, apply: bool = False) -> dict:
+    """Fill the Device Price (attr 532) of ONE survey's elements from a pasted CSV (columns: a model/part column and a price column; header names auto-detected). Matches by model number. This only touches that survey - never the team's shared presets. Elements that already have a different price are left alone unless overwrite=true. Dry run shows matches, CSV rows that matched nothing, and elements with a model but no price in the CSV. IMPORTANT: ask the user whether the CSV prices are cost or list/sell - the quote tool treats the survey price as COST and adds the markup. Max 40 per save. Dry run unless apply=true."""
+    d = C.survey(survey_id)
+    if len(csv_text) > 500_000:
+        return {"error": "CSV text is over 500 KB"}
+    rows = list(csv.reader(io.StringIO(csv_text.strip())))
+    if len(rows) < 2:
+        return {"error": "need a header row and at least one data row"}
+    head = [h.strip().lower() for h in rows[0]]
+    mi = next((i for i, h in enumerate(head) if h in ("model", "part", "part number", "part #", "part no", "mpn", "sku", "product code", "item")), None)
+    pi = next((i for i, h in enumerate(head) if h in ("price", "unit price", "cost", "unit cost", "list price", "sell price", "list", "msrp", "dealer price")), None)
+    if mi is None or pi is None:
+        return {"error": f"could not find a model column and a price column in the header {rows[0]}"}
+    book, bad, dup = {}, [], []
+    for r in rows[1:]:
+        if len(r) <= max(mi, pi) or not r[mi].strip():
+            continue
+        p = _money(r[pi])
+        k = Q.norm(r[mi])
+        if p is None:
+            bad.append(r[mi])
+            continue
+        if k in book and book[k][1] != p:
+            dup.append(r[mi])
+        book[k] = (r[mi].strip(), p)
+    if dup:
+        return {"error": "the CSV gives different prices for the same model: " + ", ".join(sorted(set(dup))[:10]) + ". Fix the CSV and retry."}
+    hit, skipped, nomatch_el, used = [], [], [], set()
+    for e in d.get("elements", []):
+        if e.get("element_id") == CABLE:
+            continue
+        m = _a(e, 305)
+        if not m:
+            continue
+        k = Q.norm(m)
+        if k not in book:
+            nomatch_el.append(e.get("name"))
+            continue
+        used.add(k)
+        old = _a(e, 532)
+        new = book[k][1]
+        if old not in (None, "") and _money(old) == new:
+            continue
+        if old not in (None, "") and not overwrite:
+            skipped.append({"name": e.get("name"), "model": m, "has": old, "csv": new})
+            continue
+        C.set_attr(e, 532, f"{new:g}")
+        hit.append({"name": e.get("name"), "model": m, "was": old or None, "now": new})
+    info = {"count": len(hit), "will_set": hit[:60], "left_alone_has_different_price": skipped[:30],
+            "csv_rows_matching_nothing": [v[0] for k, v in book.items() if k not in used][:40], "elements_with_model_but_not_in_csv": nomatch_el[:40],
+            "unreadable_prices": bad[:20]}
+    if not hit:
+        return {"note": "nothing to change", **info}
+    if not apply:
+        return {"dry_run": True, **info, "ask": "are these prices your cost or list/sell?"}
+    return _commit(d, "import_price_book", info)
+
+
+# ---------------- customer-facing draft PDF ----------------
+@mcp.tool()
+@_guard
+def export_quote_pdf(survey_id: str, pricebook_path: str = "", labor_rate: float = DEF_LABOR, cable_per_ft: float = DEF_CABLE,
+                     markup_pct: float = DEF_MARKUP, tax_pct: float = DEF_TAX, customer: str = "", allow_gaps: bool = False) -> dict:
+    """Render the priced survey as a DRAFT quote PDF (equipment lines at sell price = cost + markup, cable, labor, total; no cost or markup shown) and return a download link. Refuses while any device has no model or price, unless allow_gaps=true (those lines then print as TBD). It is stamped DRAFT: the official customer document is the Salesforce CPQ quote (cpq_generate_document). Survey prices are treated as cost, like the quote tool. Read-only."""
+    from reportlab.lib import colors
+    from reportlab.lib.pagesizes import letter
+    from reportlab.lib.styles import getSampleStyleSheet
+    from reportlab.lib.units import inch
+    from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+    d = C.survey(survey_id)
+    pb = Q.load_pricebook(str(_confine(pricebook_path))) if pricebook_path else {}
+    lr = labor_rate if labor_rate >= 0 else None
+    cf = cable_per_ft if cable_per_ft >= 0 else None
+    q = Q.build_quote(d, _pal(), C.profiles(), pb, lr, cf, markup_pct, tax_pct)
+    if q["gaps"] and not allow_gaps:
+        return {"error": "the quote has gaps, so no customer PDF was made (fix them, or pass allow_gaps=true for a draft with TBD lines)", "gaps": q["gaps"][:40], "gap_count": len(q["gaps"])}
+    st = getSampleStyleSheet()
+    money = lambda v: "TBD" if v is None else f"${v:,.2f}"
+    body, total = [], 0.0
+    for l in q["lines"]:
+        unit = None if l["unit_price"] is None else round(l["unit_price"] * (1 + markup_pct / 100.0), 2)
+        ext = None if unit is None else round(unit * l["qty"], 2)
+        total += ext or 0
+        body.append([Paragraph(f'{l["type"]}<br/><font size=8 color="#555555">{(l["manufacturer"] + " " + l["model"]).strip() or "model not set"}</font>', st["BodyText"]), l["qty"], money(unit), money(ext)])
+    if q["cable_ft"]:
+        c = None if cf is None else round(q["cable_ft"] * cf, 2)
+        total += c or 0
+        body.append(["Cable and installation materials", f'{q["cable_ft"]:g} ft', money(cf), money(c)])
+    if q["labor_hours"]:
+        lab = None if lr is None else round(q["labor_hours"] * lr, 2)
+        total += lab or 0
+        body.append(["Installation labor", f'{q["labor_hours"]:g} hrs', money(lr), money(lab)])
+    tax = round(total * tax_pct / 100.0, 2)
+    rows = [["Item", "Qty", "Unit", "Amount"]] + body
+    if tax_pct:
+        rows += [["", "", "Subtotal", money(round(total, 2))], ["", "", f"Tax {tax_pct:g}%", money(tax)]]
+    rows.append(["", "", "TOTAL", money(round(total + tax, 2))])
+    od = OUT / "quotes"
+    od.mkdir(parents=True, exist_ok=True)
+    p = od / (re.sub(r"[^\w\-]+", "_", d.get("title") or survey_id) + "_DRAFT_quote.pdf")
+
+    def stamp(cv, doc):
+        cv.saveState()
+        cv.setFont("Helvetica-Bold", 90)
+        cv.setFillColor(colors.Color(0.85, 0.85, 0.85, alpha=0.35))
+        cv.translate(letter[0] / 2, letter[1] / 2)
+        cv.rotate(40)
+        cv.drawCentredString(0, 0, "DRAFT")
+        cv.restoreState()
+        cv.setFont("Helvetica", 8)
+        cv.setFillColor(colors.grey)
+        cv.drawString(0.75 * inch, 0.5 * inch, "DRAFT generated from a site survey for internal review. Official pricing is the Salesforce CPQ quote.")
+
+    doc = SimpleDocTemplate(str(p), pagesize=letter, leftMargin=0.75 * inch, rightMargin=0.75 * inch, topMargin=0.75 * inch, bottomMargin=0.8 * inch, title=f"DRAFT quote - {d.get('title')}")
+    t = Table(rows, colWidths=[3.8 * inch, 0.8 * inch, 1.1 * inch, 1.3 * inch], repeatRows=1)
+    t.setStyle(TableStyle([("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#222222")), ("TEXTCOLOR", (0, 0), (-1, 0), colors.white), ("ALIGN", (1, 0), (-1, -1), "RIGHT"),
+                           ("VALIGN", (0, 0), (-1, -1), "TOP"), ("ROWBACKGROUNDS", (0, 1), (-1, -2), [colors.white, colors.HexColor("#f3f3f3")]),
+                           ("FONTNAME", (0, -1), (-1, -1), "Helvetica-Bold"), ("LINEABOVE", (0, -1), (-1, -1), 1, colors.black)]))
+    doc.build([Paragraph("DRAFT Quote", st["Title"]), Paragraph(f'{d.get("title") or ""}', st["Heading3"]),
+               Paragraph(f'{("Prepared for " + customer + " - ") if customer else ""}{time.strftime("%B %d, %Y")}', st["Normal"]), Spacer(1, 14), t], onFirstPage=stamp, onLaterPages=stamp)
+    return {"pdf": str(p), "link": _link(p), "total": round(total + tax, 2), "lines": len(body), "gaps_shown_as_TBD": len(q["gaps"]),
+            "note": "DRAFT only. Build the real customer quote in Salesforce CPQ (cpq_add_lines, then cpq_generate_document)."}
+
+
 # ---------------- misc ----------------
 @mcp.tool()
 @_guard
@@ -1037,10 +1652,12 @@ def restore_backup(survey_id: str, backup: str, apply: bool = False) -> dict:
     df = _diff(live, snap)
     summary = {"would_remove": [_nm(live, i) for i in df["removed"]], "would_re_add": [_nm(snap, i) for i in df["added"]],
                "would_revert_changes_on": [_nm(live, i) for i in df["changed"]]}
+    if _meta(live, snap):
+        summary["would_revert_title"] = {"from": live.get("title"), "to": snap.get("title")}
     if not apply:
         return {"dry_run": True, **summary}
     snap["version"] = live.get("version")
-    return _commit(snap, "restore_backup", summary, force_count=len(df["changed"]) + len(df["removed"]) + len(df["added"]))
+    return _commit(snap, "restore_backup", summary, force_count=len(df["changed"]) + len(df["removed"]) + len(df["added"]) + len(_meta(live, snap)))
 
 
 # ---------------- HTTP server ----------------
@@ -1135,7 +1752,7 @@ async def _download(request):
     exp, sig = request.query_params.get("exp", "0"), request.query_params.get("sig", "")
     want = hmac.new(MCP_TOKEN.encode(), f"{name}|{exp}".encode(), hashlib.sha256).hexdigest()[:40]
     p = _find_file(name)
-    if not exp.isdigit() or p is None or p.suffix.lower() not in (".png", ".jpg", ".xlsx", ".csv") or not hmac.compare_digest(sig, want) or int(exp) < time.time():
+    if not exp.isdigit() or p is None or p.suffix.lower() not in (".png", ".jpg", ".xlsx", ".csv", ".pdf") or not hmac.compare_digest(sig, want) or int(exp) < time.time():
         return PlainTextResponse("not found", status_code=404)
     return FileResponse(p)
 

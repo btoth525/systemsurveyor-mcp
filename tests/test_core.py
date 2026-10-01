@@ -118,3 +118,83 @@ def test_confine_only_in_server_mode(monkeypatch):
     assert str(S._confine("x.csv")).startswith(str(S.OUT.resolve()))
     monkeypatch.setattr(S, "HTTP_MODE", False)
     assert str(S._confine("/etc/passwd")).endswith("passwd")
+
+
+def test_meta_title_change_is_detected():
+    assert S._meta({"title": "A"}, {"title": "B"}) == ["title"]
+    assert S._meta({"title": "A"}, {"title": "A"}) == []
+    assert S._meta({"title": "A"}, {}) == []
+
+
+def test_title_validation():
+    assert S._title_ok("  Opp Name  ") == "Opp Name"
+    for bad in ("", "   ", "x" * 201, "a\nb"):
+        with pytest.raises(SSError):
+            S._title_ok(bad)
+
+
+def test_since_parsing():
+    assert S._since("1790822288") == 1790822288.0
+    assert S._since("2026-09-30T12:00:00Z") == S._since("2026-09-30T12:00:00+00:00")
+    with pytest.raises(SSError):
+        S._since("yesterday")
+
+
+def test_my_parts_roundtrip_and_validation():
+    assert S.my_parts("save", "Acme", "CD-53E", 123.5, "dome")["saved"]["model"] == "CD-53E"
+    assert S.my_parts("save", "Acme", "cd53e", 130)["count"] == 1      # same model replaces
+    assert "error" in S.my_parts("save", "Acme", "X1", -5)
+    assert "error" in S.my_parts("save", "", "X1")
+    assert S.my_parts("list")["parts"][0]["price"] == 130
+    assert S.my_parts("delete", model="CD53E")["count"] == 0
+
+
+def test_import_price_book_survey_only(monkeypatch):
+    doc = {"id": "s", "title": "t", "version": 1, "elements": [
+        el("a", 69, **{"305": "CD53-E", "141": "FCAM-001"}), el("b", 69, **{"305": "CD53-E", "141": "FCAM-002", "532": "50"}),
+        el("c", 69, **{"305": "ZZ9", "141": "FCAM-003"})]}
+    import copy
+    monkeypatch.setattr(S.C, "attr_name", lambda i: str(i))
+    monkeypatch.setattr(S.C, "survey", lambda i: copy.deepcopy(doc))
+    r = S.import_price_book("Model,Price\nCD53E,$1,100\n", "s")
+    assert "error" in r or r.get("dry_run")                      # unquoted comma in price: still handled without crashing
+    r = S.import_price_book('Model,Price\nCD53E,"$1,100.00"\nNOPE,5\n', "s")
+    assert r["dry_run"] and r["count"] == 1 and r["will_set"][0]["now"] == 1100.0
+    assert r["left_alone_has_different_price"][0]["name"] == "b"
+    assert r["csv_rows_matching_nothing"] == ["NOPE"] and r["elements_with_model_but_not_in_csv"] == ["c"]
+    assert "error" in S.import_price_book("Model,Price\nA,1\nA,2\n", "s")
+    assert "error" in S.import_price_book("foo,bar\n1,2\n", "s")
+
+
+def test_cable_type_validation(monkeypatch):
+    monkeypatch.setattr(S.C, "templates", lambda: {65: {"attrs": {526: {"options": ["None", "CAT6"]}}}})
+    assert S._cable_type("cat6") == "CAT6" and S._cable_type("") is None
+    with pytest.raises(SSError):
+        S._cable_type("CAT9")
+
+
+def test_add_cable_geometry_and_dedupe(monkeypatch):
+    a = {**el("a", 110, **{"141": "IC-001"}), "position": {"x": 100.0, "y": 100.0}}
+    b = {**el("b", 66, **{"141": "NS-001"}), "position": {"x": 200.0, "y": 100.0}}
+    doc = {"id": "s", "title": "t", "version": 1, "unit": "imperial", "floorplan_scale": 0.5, "icon_size": 10, "elements": [a, b]}
+    monkeypatch.setattr(S.C, "survey", lambda i: doc)
+    monkeypatch.setattr(S.C, "attr_name", lambda i: str(i))
+    monkeypatch.setattr(S.C, "templates", lambda: {65: {"abbreviation": "CP-", "name": "Cable Path", "systemtype_id": 8, "color": "fe8402", "attrs": {526: {"name": "Cable Type", "default": "None", "options": ["None", "CAT6"]}}}})
+    r = S.add_cable_path("s", "IC-001", "NS-001", "CAT6")
+    w = 10 * 0.981
+    assert r["dry_run"] and r["would_add"]["length_ft"] == round((200 - (100 + w)) * 0.5) and r["would_add"]["length_measured_from_plan"]
+    assert "error" in S.add_cable_path("s", "IC-001", "IC-001")
+    assert "error" in S.add_cable_path("s", "IC-001", "NS-001", "CAT6", length_ft=99999)
+
+
+def test_survey_diff_pairs_by_uuid_then_id(monkeypatch):
+    monkeypatch.setattr(S.C, "attr_name", lambda i: str(i))
+    monkeypatch.setattr(S.C, "palette", lambda: {"by_id": {69: {"name": "Fixed Camera"}}})
+    a = {"title": "A", "elements": [el("u1", 69, **{"141": "FCAM-001", "305": "X"}), el("u2", 69, **{"141": "FCAM-002"})]}
+    b = {"title": "B", "elements": [el("u1", 69, **{"141": "FCAM-001", "305": "Y"}), el("n9", 69, **{"141": "FCAM-009"})]}
+    docs = {"a": a, "b": b}
+    monkeypatch.setattr(S.C, "survey", lambda i: docs[i])
+    r = S.survey_diff("a", "b")
+    assert r["counts"] == {"added": 1, "removed": 1, "changed": 1, "unchanged": 0}
+    assert r["changed"][0]["attributes"]["305 305"] == {"before": "X", "after": "Y"}
+    assert r["added"][0]["id"] == "FCAM-009" and r["removed"][0]["id"] == "FCAM-002"

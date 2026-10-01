@@ -4,3 +4,4 @@ pillow
 openpyxl
 uvicorn
 starlette
+reportlab
