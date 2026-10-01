@@ -1,0 +1,6 @@
+mcp==1.28.1
+httpx
+pillow
+openpyxl
+uvicorn
+starlette
