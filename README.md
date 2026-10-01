@@ -41,6 +41,7 @@ Everything that changes a survey is a **dry run unless `apply=true`**.
 | Read | `list_sites`, `list_surveys`, `get_survey`, `find_elements`, `get_element`, `survey_summary`, `survey_gaps`, `list_palette`, `list_profiles` (presets), `find_products`, `render_plan` (draws real icon colors), `download_floorplan`, `export_elements` (equipment schedule CSV), `survey_diff` (A vs B, or vs a backup snapshot), `recent_changes` (which surveys changed since a time), `raw_get` |
 | Change a survey | `assign_models`, `set_colors`, `set_attributes`, `rename_elements`, `place_elements`, `move_elements`, `delete_elements`, `add_cable_path`, `set_cable_path`, `copy_elements` (between your own surveys), `import_price_book` (CSV prices into one survey), `rename_survey` |
 | Survey-level | `duplicate_survey` (native copy for versioning), `replace_floorplan` (new background image, elements kept; old image saved first), `my_parts` (personal parts catalog, merged into `find_products`) |
+| Native reports and exports | `list_reports`, `get_report` (download a finished report), `export_survey_xlsx` (the app's own Excel export), `create_report` (Layout with real device icons and camera coverage, optional legend, Bill of Materials, Elements, Cables, Photo Tour; dry run until `apply=true`, because it adds a report record the whole team sees). Every result includes ready-made arguments for attaching the file to a CRM record |
 | BOM and quote | `load_bom`, `match_parts`, `match_bom`, `bom`, `bom_diff` (BOM vs survey by model), `quote`, `export_quote_pdf` (DRAFT-stamped customer PDF), `propose_placement`, `apply_placement` |
 | Safety and ops | `status`, `list_backups`, `restore_backup` |
 
@@ -171,3 +172,5 @@ When adding a change tool, follow the pattern: select targets with `_select` (wh
 - Coverage-area *geometry* (angle, direction, radius) is deliberately read-only for the AI. Color and transparency only.
 - A login lapse needs a human (captcha), by design the container tells you rather than trying to bypass it.
 - One writer at a time (a process-wide lock around saves).
+
+Reports are rendered by System Surveyor itself and downloaded as-is; this server never redraws plans. `create_report` only creates a report record in the site (surveys are never changed), is a dry run by default, and requires all surveys to be on the server's team and in one site.

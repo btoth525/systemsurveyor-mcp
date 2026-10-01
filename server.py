@@ -6,6 +6,7 @@ from mcp.server.fastmcp import FastMCP
 from ssapi import SSAuthError, Client, SSError
 import quote as Q
 import plan as P
+import reports as R
 
 from mcp.server.transport_security import TransportSecuritySettings
 
@@ -20,6 +21,7 @@ Colors: set_colors changes icon colors (and coverage/field-of-view colors, inclu
 Looking things up: find_elements (search/filter a survey), get_element (every attribute of one), bom_diff (a Salesforce BOM vs what the survey says, by model), export_elements (equipment schedule CSV). Elements can be named by uuid or by ID like FCAM-001; an unknown or duplicated name is an error, never a guess. Cable paths are never moved or deleted by accident: move_elements refuses lines, delete_elements refuses to leave a cable dangling. The server itself counts what a save really changes and refuses oversized saves, and refuses any save that removes elements unless it is delete_elements or restore_backup.
 Survey-level tools: rename_survey (title; read the exact Salesforce opportunity name first), duplicate_survey (server-side copy for versioning), replace_floorplan (new background image, elements kept; image must be the same pixel size), survey_diff (A vs B, or vs a 'backup:<file>'), recent_changes (which surveys changed since a time), copy_elements (between the user's own surveys), add_cable_path / set_cable_path (cable runs with type and length), import_price_book (CSV prices into ONE survey - ask whether they are cost or list, because quote treats survey prices as cost and adds markup), export_quote_pdf (a DRAFT-stamped customer PDF; the real quote is Salesforce CPQ). my_parts keeps a personal parts list; the team's shared presets are never written by this server because they belong to everyone.
 Survey -> Salesforce recipe (Salesforce stays read-only here): the user names the opportunity -> salesforce_query for its exact name -> rename_survey (dry run, yes, apply) -> bom -> cpq_match_parts -> cpq_preview_changes -> user confirms -> cpq_add_lines. Use Salesforce CPQ list/sell prices for the quote, not the survey's device price.
+Native reports (the real thing, rendered by System Surveyor itself - never recreate them): list_reports / get_report download finished reports; export_survey_xlsx runs the app's Excel export; create_report builds a new one (Layout = floor plan with real device icons and camera coverage that stops at walls; legend=true adds its Title Block & Legend key; system_types=["Video Surveillance"] gives a camera-only view; also BOM, Elements, Cables, Photo Tour). create_report adds a record the whole team can see, so preview it, show the user, wait for a yes, then apply=true. Every output carries salesforce_attach_file_args: find the opportunity with salesforce_query, show its exact name, and attach only after the user's yes (the 'x ' file-name prefix makes Conga merge it into the Job Summary). The official quote is still Salesforce CPQ cpq_generate_document, not export_quote_pdf.
 Unknown values stay unknown: report gaps, do not invent prices or model numbers."""
 
 mcp = FastMCP("systemsurveyor", instructions=INSTRUCTIONS, host="0.0.0.0", port=int(os.environ.get("PORT", 8797)),
@@ -966,6 +968,151 @@ def export_elements(survey_id: str) -> dict:
     return {"rows": len(d.get("elements", [])), "path": str(p), "link": _link(p)}
 
 
+# ---------------- native reports + exports (System Surveyor renders these itself) ----------------
+def _site_of(d):
+    s_ = d.get("site")
+    return s_["id"] if isinstance(s_, dict) else s_
+
+
+def _site_arg(survey_id, site_id):
+    if survey_id:
+        d = C.survey(survey_id)
+        if d.get("team_id") != C.team_id():
+            raise SSError(f"that survey belongs to team {d.get('team_id')}, not this server's team")
+        return _site_of(d)
+    if not site_id:
+        raise SSError("give survey_id (any survey on the site) or site_id")
+    return site_id
+
+
+def _rrow(r):
+    c = r.get("config") or {}
+    cr = r.get("creator") or {}
+    return {"id": r.get("id"), "name": r.get("name"), "types": r.get("report_types"), "output": c.get("outputType") or "pdf", "status": r.get("status"),
+            "surveys": len(r.get("survey_ids") or []), "legend": bool((c.get("layoutReport") or {}).get("useProReport")),
+            "created": time.strftime("%Y-%m-%d %H:%M", time.localtime(r.get("created_at") or 0)),
+            "by": f"{cr.get('first_name', '')} {cr.get('last_name', '')}".strip(), "mine": bool(OWNER_USER_ID and cr.get("user_id") == OWNER_USER_ID),
+            "ready": bool(r.get("file_path")) and r.get("status") == "completed"}
+
+
+def _sf_handoff(path, what):
+    """Ready-made arguments for the Salesforce MCP. The agent finds the opportunity first and asks the user before attaching."""
+    p = Path(path)
+    mb = round(p.stat().st_size / 1048576, 2)
+    out = {"file": p.name, "size_mb": mb, "link": _link(p),
+           "salesforce_attach_file_args": {"file_name": f"x {what}{p.suffix}", "url": _link(p), "description": f"System Surveyor {what} (native export)"},
+           "how": "Find the opportunity with salesforce_query/salesforce_search, show its exact name to the user, and only after their yes call salesforce_attach_file with these args plus record=<opportunity id>. "
+                  "The 'x ' prefix is what makes Conga merge the file into the Job Summary. Alternatively set System_Surveyor_Link__c with salesforce_update_record (also after a yes)."}
+    if mb > 10:
+        out["warning"] = f"{mb} MB: over 10 MB the Conga merge can fail; consider a filtered or smaller report (system_types / statuses)."
+    if mb > 25:
+        out["blocked"] = "over Salesforce's 25 MB attach limit; make a smaller report first."
+    return out
+
+
+@mcp.tool()
+@_guard
+def list_reports(survey_id: str = "", site_id: str = "", limit: int = 30) -> dict:
+    """List System Surveyor's native reports for a site (give any survey_id on it, or site_id): name, types, pdf/xlsx, status, who made it, whether it is yours, whether it has a legend, and the id to pass to get_report. Newest first. Read-only."""
+    rows = [_rrow(r) for r in sorted(C.reports(_site_arg(survey_id, site_id)), key=lambda r: r.get("created_at") or 0, reverse=True)]
+    return {"total": len(rows), "reports": rows[:limit]}
+
+
+@mcp.tool()
+@_guard
+def get_report(report_id: str, survey_id: str = "", site_id: str = "") -> dict:
+    """Download a finished native System Surveyor report (the real PDF or Excel the app produces: layout with device icons, camera coverage and boundaries, bill of materials, elements, photo tour...) and return a download link plus ready-made arguments for salesforce_attach_file. Give the report_id from list_reports and any survey_id on the site (or site_id). Read-only: nothing in System Surveyor changes."""
+    rec = next((r for r in C.reports(_site_arg(survey_id, site_id)) if r.get("id") == report_id), None)
+    if not rec:
+        return {"error": "no report with that id on that site (use list_reports)"}
+    if rec.get("status") != "completed" or not rec.get("file_path"):
+        return {"error": f"that report is not ready (status {rec.get('status')})"}
+    ext = Path(rec["file_path"]).suffix.lower() or ".pdf"
+    od = OUT / "reports"
+    od.mkdir(parents=True, exist_ok=True)
+    p = od / (re.sub(r"[^\w\-]+", "_", rec.get("name") or report_id)[:80] + "_" + report_id[:8] + ext)
+    p.write_bytes(C.report_download(rec["file_path"]))
+    return {**_rrow(rec), **_sf_handoff(p, (rec.get("name") or "report")[:80])}
+
+
+@mcp.tool()
+@_guard
+def export_survey_xlsx(survey_id: str) -> dict:
+    """Run System Surveyor's own Excel export for one survey (the same workbook as Export in the app: every element and attribute) and return a download link plus salesforce_attach_file arguments. Nothing in System Surveyor changes and no record is created. Takes up to a minute."""
+    d = C.survey(survey_id)
+    if d.get("team_id") != C.team_id():
+        return {"error": f"that survey belongs to team {d.get('team_id')}, not this server's team"}
+    od = OUT / "reports"
+    od.mkdir(parents=True, exist_ok=True)
+    p = od / (re.sub(r"[^\w\-]+", "_", d.get("title") or survey_id)[:80] + "_export.xlsx")
+    p.write_bytes(C.export_xlsx(survey_id))
+    return {"survey": d.get("title"), **_sf_handoff(p, f"{d.get('title')} survey export"[:80])}
+
+
+@mcp.tool()
+@_guard
+def create_report(survey_ids: list[str], report_types: list[str] = ["Layout"], name: str = "", output: str = "pdf", legend: bool = True,
+                  count_by: str = "Element Name", system_types: list[str] = [], statuses: list[str] = [], client_name: str = "",
+                  cover_page: bool = True, watermark: str = "", apply: bool = False) -> dict:
+    """Have System Surveyor build a native report (its own renderer: floor plan with the real device icons, camera coverage cones that stop at walls, labels, and with legend=true its 'Title Block & Legend' key of devices and counts), wait for it, download it and return a link plus salesforce_attach_file arguments.
+    report_types: Layout, Bill of Materials, Elements, Cables, Photo Tour, Element Detail. output: pdf (all) or xlsx (only Bill of Materials / Elements / Cables). system_types filters by system (e.g. ["Video Surveillance"] for a camera-only view); statuses by installation status; count_by sets what the legend counts.
+    All surveys must be on this server's team and in ONE site (max 10). This adds one report record to the site's report list, visible to the whole team, so it is a DRY RUN that shows exactly what would be created unless apply=true - show the user the preview and wait for their yes. Surveys themselves are never changed."""
+    if not survey_ids or len(survey_ids) > 10:
+        return {"error": "give 1 to 10 survey ids"}
+    bad = [t for t in report_types if t not in R.REPORT_TYPES]
+    if bad or not report_types:
+        return {"error": f"report_types must be from {R.REPORT_TYPES}; got {bad or 'none'}"}
+    if output not in ("pdf", "xlsx"):
+        return {"error": "output must be pdf or xlsx"}
+    if output == "xlsx" and not set(report_types) <= R.XLSX_TYPES:
+        return {"error": f"Excel output is only available for {sorted(R.XLSX_TYPES)}; Layout, Photo Tour and Element Detail are PDF-only"}
+    if count_by not in R.COUNT_BY:
+        return {"error": f"count_by must be one of {R.COUNT_BY}"}
+    bad_st = [x for x in statuses if x not in R.STATUSES]
+    if bad_st:
+        return {"error": f"statuses must be from {R.STATUSES}; got {bad_st}"}
+    docs = [C.survey(i) for i in survey_ids]
+    sites = {_site_of(d) for d in docs}
+    if len(sites) != 1:
+        return {"error": "all surveys must be in the same site"}
+    wrong = [d.get("title") for d in docs if d.get("team_id") != C.team_id()]
+    if wrong:
+        return {"error": f"not this team's surveys: {wrong}"}
+    site = sites.pop()
+    cname = (name.strip() or f"{docs[0].get('title')} - {', '.join(report_types)} - {time.strftime('%Y-%m-%d')}")[:150]
+    cfg = R.build_config(report_types, output, client_name.strip(), cover_page, watermark.strip(), legend, count_by, system_types, statuses)
+    info = {"name": cname, "site": site, "surveys": [d.get("title") for d in docs], "report_types": report_types, "output": output, "legend": legend,
+            "filters": {"system_types": system_types, "statuses": statuses}, "cover_page": cover_page, "client_name": client_name or None}
+    if not apply:
+        return {"dry_run": True, **info, "note": "creates ONE new report record in this site, visible to the team; surveys are not changed. Ask the user, then call again with apply=true."}
+    if not WRITES:
+        return {"saved": False, "blocked": "Writes are switched off on this server (ALLOW_WRITES=false). Nothing was created."}
+    with _wlock:
+        before = {r["id"] for r in C.reports(site)}
+        C.create_report(site, cname, list(survey_ids), list(report_types), cfg)
+        rec = None
+        for _ in range(100):
+            time.sleep(3)
+            new = [r for r in C.reports(site) if r["id"] not in before and r.get("name") == cname]
+            if len(new) > 1:
+                return {"error": f"{len(new)} new reports share that name; not guessing - check list_reports", **info}
+            if new:
+                rec = new[0]
+                if rec.get("status") == "completed" and rec.get("file_path"):
+                    break
+                if rec.get("status") == "errored":
+                    return {"error": "System Surveyor reports this report failed to generate (status errored); a failed record may remain in the site list", "report_id": rec["id"], **info}
+        else:
+            return {"error": "the report is still running after 5 minutes; use list_reports then get_report later (do not create it again)", "report_id": rec and rec["id"], **info}
+    _journal("create_report", survey_ids[0], cname, report_id=rec["id"], types=report_types, output=output)
+    ext = Path(rec["file_path"]).suffix.lower() or ".pdf"
+    od = OUT / "reports"
+    od.mkdir(parents=True, exist_ok=True)
+    p = od / (re.sub(r"[^\w\-]+", "_", cname)[:80] + "_" + rec["id"][:8] + ext)
+    p.write_bytes(C.report_download(rec["file_path"]))
+    return {"saved": True, "report_id": rec["id"], **info, **_sf_handoff(p, cname[:80])}
+
+
 # ---------------- BOM + quote ----------------
 def _cpq_items(q):
     return [{"model": l["model"], "manufacturer": l["manufacturer"], "description": l["type"], "quantity": l["qty"]}
@@ -1733,7 +1880,7 @@ def _keepalive():
 
 
 def _find_file(name):
-    for base in (OUT, OUT / "quotes"):
+    for base in (OUT, OUT / "quotes", OUT / "reports"):
         p = base / Path(name).name
         if p.is_file():
             return p

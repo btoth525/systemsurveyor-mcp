@@ -2,7 +2,7 @@ FROM python:3.11-slim
 WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt && apt-get update >/dev/null 2>&1 && apt-get install -y --no-install-recommends fonts-liberation >/dev/null 2>&1; rm -rf /var/lib/apt/lists/*
-COPY ssapi.py server.py quote.py plan.py ./
+COPY ssapi.py server.py quote.py plan.py reports.py ./
 ENV SS_TOKEN_FILE=/data/tokens.json DATA_DIR=/data MCP_TRANSPORT=http PORT=8797 PYTHONUNBUFFERED=1
 VOLUME /data
 EXPOSE 8797

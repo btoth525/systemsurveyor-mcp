@@ -88,8 +88,8 @@ class Client:
         if not self.tok.get("token"):
             self.refresh()
         for attempt in (0, 1):
-            h = {"Authorization": f"Bearer {self.tok['token']}"}
-            r = self.http.request(method, (base or BASE) + path, headers=h, **kw)
+            h = {"Authorization": f"Bearer {self.tok['token']}", **(kw.get("headers") or {})}
+            r = self.http.request(method, (base or BASE) + path, **{**kw, "headers": h})
             if r.status_code == 401 and attempt == 0:
                 self.refresh()
                 continue
@@ -139,6 +139,7 @@ class Client:
                 out[c["element_id"]] = {
                     "element_id": c["element_id"], "name": c["name"], "abbreviation": c.get("abbreviation", "ELEM-"),
                     "systemtype_id": st.get("systemtype_id"), "system": st.get("name"), "color": st.get("color"), "attrs": attrs,
+                    "icon": c.get("icon") or "", "category": (c.get("category") or {}).get("elementcategory_id"),
                 }
             self._tpl = out
             self._attr_names = names
@@ -216,6 +217,39 @@ class Client:
     def upload_floorplan(self, survey_id, data, name, ctype):
         r = self.req("POST", f"/survey/{survey_id}/floorplan", base=RBASE, files={"floorplan": (name, data, ctype)})
         return r.json() if r.content else {}
+
+    # ---- native reports + exports (rendered by System Surveyor itself) ----
+    XLSX = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+
+    def reports(self, site_id):
+        j = self.get(f"/site/{site_id}/scheduled_reports")
+        return j.get("data", j) if isinstance(j, dict) else j
+
+    def report_download(self, file_path):
+        """Fetch a finished native report's bytes (S3 presigned link; no auth header is sent to S3)."""
+        u = self.get("/storage/reports/presign", params={"key": file_path})["url"]
+        r = httpx.get(u, follow_redirects=True, timeout=180)
+        r.raise_for_status()
+        return r.content
+
+    def create_report(self, site_id, name, survey_ids, report_types, config):
+        return self.req("POST", f"/site/{site_id}/scheduled_reports", json={"name": name, "survey_ids": survey_ids,
+                                                                           "report_types": report_types, "config": config}).json()
+
+    def export_xlsx(self, survey_id, tries=150):
+        """Native Excel export: start a job, poll until the workbook is ready. Returns the xlsx bytes."""
+        job = self.req("POST", f"/survey/{survey_id}/export", base=WBASE).json().get("job_id")
+        if not job:
+            raise SSError("export did not return a job id")
+        for _ in range(tries):
+            time.sleep(2)
+            try:
+                r = self.req("GET", f"/survey/export/{job}", base=WBASE, headers={"Accept": self.XLSX})
+            except SSError:
+                continue
+            if r.status_code == 200:
+                return r.content
+        raise SSError("export timed out")
 
     # ---- write path ----
     @staticmethod

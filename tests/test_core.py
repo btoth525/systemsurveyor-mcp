@@ -198,3 +198,19 @@ def test_survey_diff_pairs_by_uuid_then_id(monkeypatch):
     assert r["counts"] == {"added": 1, "removed": 1, "changed": 1, "unchanged": 0}
     assert r["changed"][0]["attributes"]["305 305"] == {"before": "X", "after": "Y"}
     assert r["added"][0]["id"] == "FCAM-009" and r["removed"][0]["id"] == "FCAM-002"
+
+
+def test_report_config_defaults_are_generic():
+    import json, reports
+    c = reports.build_config(["Layout", "Bill of Materials"], legend=True, system_types=["Video Surveillance"], statuses=["Proposed"])
+    assert c["layoutReport"]["useProReport"] is True
+    assert c["layoutReport"]["selectedFilters"] == {"System Type": ["Video Surveillance"], "Installation Status": ["Proposed"]}
+    assert "System Type" in c["billOfMaterialsReport"]["selectedFilters"]
+    assert "bootstrapLocalStorage" not in c and c["clientName"] == ""
+
+
+def test_create_report_rejects_bad_input_before_any_network():
+    import server
+    assert "error" in server.create_report([], ["Layout"])
+    assert "error" in server.create_report(["x"], ["Nope"])
+    assert "error" in server.create_report(["x"], ["Layout"], output="xlsx")
