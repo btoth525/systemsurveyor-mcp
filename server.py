@@ -1,5 +1,5 @@
 """System Surveyor MCP server. Writes are dry-run unless apply=true."""
-import base64, collections, functools, hashlib, hmac, json, os, re, threading, time
+import base64, collections, csv, functools, hashlib, hmac, json, math, os, re, sys, threading, time
 from pathlib import Path
 import httpx
 from mcp.server.fastmcp import FastMCP
@@ -17,6 +17,7 @@ Typical jobs:
 - "Place this Salesforce BOM": read the quote with salesforce-mcp cpq_read_quote, pass its lines to match_parts, then render_plan and ask the user where each part goes, then place_elements with x/y in plan pixels.
 Every change tool is a dry run unless apply=true. Writes are refused unless the server has them enabled AND the survey is on its allowlist, and are capped per save. Rules for you: never call apply=true until you have shown the dry-run list to the user and they said yes in this conversation; if anything is ambiguous (which model, indoor/outdoor, where a part goes, duplicate names, a price that might be cost vs list) ask first, never guess; change only what was asked and only the survey named; never delete unless explicitly told. Each save takes a snapshot first, then re-reads the survey and reports verified true/false; if anything is off, restore_backup undoes it (call list_backups). Writes only work on the owner's own surveys (or ones he allowlisted), max 40 elements per save. Call status if something fails. Tools for changing a survey: assign_models (model/manufacturer/price; copy_specs=true also copies product specs but never the surveyed mount height/coverage/frame rates), rename_elements (fix_duplicates=true numbers duplicates correctly), place_elements, move_elements, delete_elements (only when told to), restore_backup.
 Colors: set_colors changes icon colors (and coverage/field-of-view colors, including each lens of a multi-lens camera) without touching surveyed geometry - ask the user which scheme (one color for everything, by model, by type, by status, by system, or per-lens colors) and show the color_map from the dry run before applying. set_attributes sets any attribute on a group (status, description, mount height) with old values shown. survey_summary gives a quick overview. BOM placement: when the user gives a BOM (or a Salesforce quote), call propose_placement, show the plan and ASK the user every question it returns (never choose locations yourself), use render_plan with the proposed points so they can confirm spots, then apply_placement dry run, yes, apply. Prefer assigning BOM parts to existing blank elements over adding new ones.
+Looking things up: find_elements (search/filter a survey), get_element (every attribute of one), bom_diff (a Salesforce BOM vs what the survey says, by model), export_elements (equipment schedule CSV). Elements can be named by uuid or by ID like FCAM-001; an unknown or duplicated name is an error, never a guess. Cable paths are never moved or deleted by accident: move_elements refuses lines, delete_elements refuses to leave a cable dangling. The server itself counts what a save really changes and refuses oversized saves, and refuses any save that removes elements unless it is delete_elements or restore_backup.
 Unknown values stay unknown: report gaps, do not invent prices or model numbers."""
 
 mcp = FastMCP("systemsurveyor", instructions=INSTRUCTIONS, host="0.0.0.0", port=int(os.environ.get("PORT", 8797)),
@@ -33,6 +34,7 @@ DEF_CABLE = float(os.environ.get("CABLE_PER_FT", -1))
 DEF_MARKUP = float(os.environ.get("MARKUP_PCT", 0))
 DEF_TAX = float(os.environ.get("TAX_PCT", 0))
 MAX_ELEMENTS = int(os.environ.get("MAX_ELEMENTS_PER_WRITE", 40))
+HTTP_MODE = os.environ.get("MCP_TRANSPORT") == "http" or "--http" in sys.argv
 PUBLIC_URL = os.environ.get("PUBLIC_URL", "").rstrip("/")
 MCP_TOKEN = os.environ.get("MCP_TOKEN", "")
 _wlock = threading.Lock()
@@ -53,13 +55,32 @@ def _norm_attrs(e):
     return {a["attribute_id"]: C._sval(a.get("value")) for a in e.get("attributes", [])}
 
 
+def _pos(e):
+    return json.dumps(e.get("position"), sort_keys=True)
+
+
+def _diff(old, new):
+    """What a save would actually change, computed from the documents themselves (not from what a tool says it did)."""
+    a, b = {e["id"]: e for e in old.get("elements", [])}, {e["id"]: e for e in new.get("elements", [])}
+    changed = [i for i in b if i in a and (_norm_attrs(a[i]) != _norm_attrs(b[i]) or _pos(a[i]) != _pos(b[i])
+                                           or a[i].get("element_profile_id") != b[i].get("element_profile_id"))]
+    return {"changed": changed, "added": [i for i in b if i not in a], "removed": [i for i in a if i not in b]}
+
+
+def _nm(doc, i):
+    for e in doc.get("elements", []):
+        if e["id"] == i:
+            return e.get("name")
+    return i
+
+
 def _verify(d, live):
     """Re-read after saving: every element we meant to save must be there with the same attributes."""
     want = {e["id"]: e for e in d.get("elements", [])}
     got = {e["id"]: e for e in live.get("elements", [])}
     bad = [i for i in want if i not in got] + [i for i in got if i not in want]
     for i, e in want.items():
-        if i in got and _norm_attrs(e) != _norm_attrs(got[i]):
+        if i in got and (_norm_attrs(e) != _norm_attrs(got[i]) or _pos(e) != _pos(got[i])):
             bad.append(i)
     return {"ok": not bad, "mismatched_ids": bad[:10], "elements": len(got)}
 
@@ -78,6 +99,15 @@ def _commit(d, tool, extra, force_count=None):
             return {"saved": False, "blocked": why}
         if live.get("version") != d.get("version"):
             return {"saved": False, "error": "survey changed while working; re-read and redo"}
+        df = _diff(live, d)
+        actual = len(df["changed"]) + len(df["added"]) + len(df["removed"])
+        n = max(n, actual)
+        if actual == 0:
+            return {"saved": False, "note": "nothing would change (already as requested). No save was made."}
+        if n > MAX_ELEMENTS:
+            return {"saved": False, "blocked": f"{n} elements would change, over the limit of {MAX_ELEMENTS} per save. Split the change into smaller batches."}
+        if df["removed"] and tool not in ("delete_elements", "restore_backup"):
+            return {"saved": False, "blocked": f"{tool} would remove {len(df['removed'])} element(s), which it must never do. Nothing changed."}
         ed = live.get("editor")
         ed = ed.get("user_id") if isinstance(ed, dict) else ed
         if ed not in (None, "", 0) and OWNER_USER_ID and ed != OWNER_USER_ID:
@@ -92,8 +122,9 @@ def _commit(d, tool, extra, force_count=None):
         after = C.survey(d["id"])
         ver = _verify(d, after)
         with open(OUT / "journal.jsonl", "a") as f:
-            f.write(json.dumps({"t": stamp, "tool": tool, "survey": d["id"], "title": d.get("title"), "n": n, "verified": ver["ok"]}) + "\n")
-        out = {"saved": True, **extra, "backup": f"{d['id']}-{stamp}.json", "verified": ver}
+            f.write(json.dumps({"t": stamp, "tool": tool, "survey": d["id"], "title": d.get("title"), "n": n, "verified": ver["ok"],
+                                "changed": [_nm(live, i) for i in df["changed"]][:60], "added": len(df["added"]), "removed": [_nm(live, i) for i in df["removed"]][:60]}) + "\n")
+        out = {"saved": True, **extra, "actual_changes": {k: len(v) for k, v in df.items()}, "backup": f"{d['id']}-{stamp}.json", "verified": ver}
         if not ver["ok"]:
             out["warning"] = "saved, but the re-read does not match what was sent. Check the survey; the backup can restore it (restore_backup)."
         return out
@@ -142,7 +173,55 @@ def _guard(fn):
             return fn(*a, **k)
         except SSError as e:
             return {"error": str(e)}
+        except httpx.HTTPError as e:
+            return {"error": f"network problem talking to a remote service ({type(e).__name__}). Nothing was changed; try again."}
+        except (KeyError, TypeError, ValueError, AttributeError, IndexError) as e:
+            return {"error": f"bad input ({type(e).__name__}: {e}). Nothing was changed. Check the argument names and types in the tool description."}
     return w
+
+
+def _resolve(d, refs):
+    """Elements for a list of uuids / names / IDs. Unknown or ambiguous references are an error, never silently skipped."""
+    out, seen = [], set()
+    els = d.get("elements", [])
+    for r in refs:
+        hits = [e for e in els if e["id"] == r] or [e for e in els if r in (e.get("name"), _a(e, 141))]
+        if not hits:
+            raise SSError(f"element '{r}' not found in this survey")
+        if len(hits) > 1:
+            raise SSError(f"'{r}' matches {len(hits)} elements (duplicate names); use the uuid from find_elements")
+        if hits[0]["id"] not in seen:
+            seen.add(hits[0]["id"])
+            out.append(hits[0])
+    return out
+
+
+def _xy(m):
+    try:
+        x, y = float(m["x"]), float(m["y"])
+    except (KeyError, TypeError, ValueError):
+        raise SSError(f"each location needs numeric x and y (plan pixels), got {m}")
+    if not (math.isfinite(x) and math.isfinite(y)) or not (0 <= x <= 50000 and 0 <= y <= 50000):
+        raise SSError(f"x/y out of range: {x}, {y} (plan pixels, 0..50000)")
+    return round(x, 2), round(y, 2)
+
+
+def _confine(path):
+    """In HTTP (container) mode the AI may only read/write under the data folder."""
+    p = Path(path)
+    if not HTTP_MODE:
+        return p
+    try:
+        q = (p if p.is_absolute() else OUT / p).resolve()
+        q.relative_to(OUT.resolve())
+    except Exception:
+        raise SSError(f"in server mode files must be inside {OUT}")
+    return q
+
+
+def _cables_touching(d, idset):
+    return [e for e in d.get("elements", []) if e.get("element_id") == CABLE and e["id"] not in idset
+            and any(((e.get("connections") or {}).get(side) or {}).get("id") in idset for side in ("start", "end"))]
 
 
 # attributes that describe the surveyed design, never overwritten from a preset
@@ -172,14 +251,15 @@ def list_sites(search: str = "", favorites_only: bool = False) -> list:
 @_guard
 def list_surveys(site_id: str) -> list:
     """List the surveys (floor plans) of a site. site_id is the UUID string from list_sites."""
-    return [{"id": s["id"], "title": s["title"], "status": s.get("status"), "elements": s.get("element_count"), "modified": s.get("modified_at")}
+    return [{"id": s["id"], "title": s["title"], "status": s.get("status"), "elements": s.get("element_count"), "modified": s.get("modified_at"),
+             "claimed_for_editing_by": (s.get("editor") or {}).get("first_name") if isinstance(s.get("editor"), dict) else s.get("editor")}
             for s in C.surveys(site_id)]
 
 
 @mcp.tool()
 @_guard
-def get_survey(survey_id: str, elements: bool = True, limit: int = 300) -> dict:
-    """Survey summary plus a compact list of elements (id, name, type, x/y plan pixels, status, manufacturer, model, price)."""
+def get_survey(survey_id: str, elements: bool = True, limit: int = 300, offset: int = 0) -> dict:
+    """Survey summary plus a compact list of elements (id, name, type, x/y plan pixels, status, manufacturer, model, price). `truncated` is true when there are more than limit (page with offset, or use find_elements)."""
     d = C.survey(survey_id)
     pal = _pal()
     out = {k: d.get(k) for k in ("id", "title", "unit", "floorplan_scale", "icon_size", "version", "modified_at", "modified_source", "summary")}
@@ -187,7 +267,9 @@ def get_survey(survey_id: str, elements: bool = True, limit: int = 300) -> dict:
     els = d.get("elements", [])
     out["element_count"] = len(els)
     if elements:
-        out["elements"] = [_brief(e, pal) for e in els[:limit]]
+        out["elements"] = [_brief(e, pal) for e in els[offset:offset + limit]]
+        out["truncated"] = offset + limit < len(els)
+    out["editor"] = d.get("editor")
     return out
 
 
@@ -278,20 +360,15 @@ def assign_models(survey_id: str, ids: list[str] = [], element_id: int = 0, name
         prof = next((p for p in C.profiles() if p["id"] == profile_id), None)
         if not prof:
             return {"error": f"unknown profile_id {profile_id}"}
-    want = set(ids)
+    cand = _select(d, ids, element_id, name_prefix)
+    skipped = {"wrong_type_for_preset": 0, "already_has_model": 0}
     targets = []
-    for e in d.get("elements", []):
-        if want and e["id"] not in want and e.get("name") not in want and _a(e, 141) not in want:
-            continue
-        if not want and not (element_id or name_prefix):
-            return {"error": "give ids, element_id or name_prefix so I know which elements to change"}
-        if element_id and e.get("element_id") != element_id:
-            continue
-        if name_prefix and not str(e.get("name", "")).startswith(name_prefix):
-            continue
+    for e in cand:
         if prof and e.get("element_id") != prof["element_id"]:
+            skipped["wrong_type_for_preset"] += 1
             continue
         if only_missing and _a(e, 305):
+            skipped["already_has_model"] += 1
             continue
         targets.append(e)
     vals = {}
@@ -307,10 +384,12 @@ def assign_models(survey_id: str, ids: list[str] = [], element_id: int = 0, name
     if description:
         vals[173] = description
     vals.update({int(k): v for k, v in attributes.items()})
+    if 141 in vals or 140 in vals:
+        return {"error": "the element ID/name (141/140) cannot be set here; use rename_elements"}
     if not vals:
         return {"error": "nothing to set: pass profile_id or model/manufacturer/price/description/attributes"}
     if not targets:
-        return {"error": "no matching elements (check only_missing / filters)"}
+        return {"error": "no matching elements (check only_missing / filters)", "skipped": skipped}
     pal = _pal()
     for e in targets:
         for k, v in vals.items():
@@ -319,7 +398,7 @@ def assign_models(survey_id: str, ids: list[str] = [], element_id: int = 0, name
             e["element_profile_id"] = prof["id"]
     preview = [_brief(e, pal) for e in targets]
     if not apply:
-        return {"dry_run": True, "count": len(targets), "set": {C.attr_name(k): v for k, v in vals.items()}, "would_update": preview}
+        return {"dry_run": True, "count": len(targets), "skipped": skipped, "set": {C.attr_name(k): v for k, v in vals.items()}, "would_update": preview}
     return _commit(d, "assign_models", {"count": len(targets), "updated": preview})
 
 
@@ -340,13 +419,22 @@ def place_elements(survey_id: str, items: list[dict], apply: bool = False) -> di
         eid = i.get("element_id") or (prof or {}).get("element_id")
         if not eid:
             return {"error": "each item needs element_id or profile_id"}
+        if int(eid) == CABLE:
+            return {"error": "cable paths are lines between devices; draw them in the web app. Place devices here."}
+        x, y = _xy(i)
+        if i.get("name") and any(i["name"] in (e.get("name"), _a(e, 141)) for e in d["elements"]):
+            return {"error": f"the name {i['name']} is already used in this survey"}
         at = {int(k): v for k, v in (i.get("attributes") or {}).items()}
         for key, aid in (("manufacturer", 271), ("model", 305), ("price", 532), ("description", 173)):
             if i.get(key) not in (None, ""):
                 at[aid] = i[key]
-        el = C.new_element(d, eid, i["x"], i["y"], i.get("name"), at, prof)
+        if 141 in at or 140 in at:
+            return {"error": "set the name with the name field, not attributes 141/140"}
+        el = C.new_element(d, eid, x, y, i.get("name"), at, prof)
         d["elements"].append(el)
         new.append(el)
+    if not new:
+        return {"error": "items is empty"}
     preview = [_brief(e, _pal()) for e in new]
     if not apply:
         return {"dry_run": True, "would_add": preview}
@@ -356,16 +444,28 @@ def place_elements(survey_id: str, items: list[dict], apply: bool = False) -> di
 @mcp.tool()
 @_guard
 def move_elements(survey_id: str, moves: list[dict], apply: bool = False) -> dict:
-    """Move elements. moves: [{id, x, y}] (element uuid from get_survey). Dry run unless apply=true."""
+    """Move devices on the plan. moves: [{id: uuid or name like FCAM-001, x, y}] in plan pixels (render_plan shows the grid). Cable paths (lines) cannot be moved here. Shows from -> to for each. Dry run unless apply=true."""
     d = C.survey(survey_id)
-    by = {e["id"]: e for e in d["elements"]}
-    for m in moves:
-        if m["id"] not in by:
-            return {"error": f"element {m['id']} not found"}
-        by[m["id"]]["position"] = {"x": float(m["x"]), "y": float(m["y"])}
+    if not moves:
+        return {"error": "moves is empty"}
+    refs = [m.get("id") for m in moves]
+    if len(set(refs)) != len(refs):
+        return {"error": "an element appears twice in moves"}
+    rows = []
+    for m, e in zip(moves, _resolve(d, refs)):
+        p = e.get("position")
+        if not isinstance(p, dict):
+            return {"error": f"{e.get('name')} is a line/cable path; moving it here would corrupt it. Edit it in the web app."}
+        x, y = _xy(m)
+        rows.append({"id": e["id"], "name": e.get("name"), "from": [round(p["x"], 1), round(p["y"], 1)], "to": [x, y]})
+        e["position"] = {"x": x, "y": y}
+    touching = _cables_touching(d, {r["id"] for r in rows})
+    info = {"moves": len(rows), "rows": rows}
+    if touching:
+        info["note"] = "cable paths attached to these devices keep their drawn route: " + ", ".join(str(c.get("name")) for c in touching[:12])
     if not apply:
-        return {"dry_run": True, "moves": moves}
-    return _commit(d, "move_elements", {"moves": len(moves)})
+        return {"dry_run": True, **info}
+    return _commit(d, "move_elements", info)
 
 
 @mcp.tool()
@@ -408,17 +508,26 @@ def rename_elements(survey_id: str, renames: list[dict] = [], fix_duplicates: bo
 
 @mcp.tool()
 @_guard
-def delete_elements(survey_id: str, ids: list[str], apply: bool = False) -> dict:
-    """Delete elements by uuid. Dry run unless apply=true."""
+def delete_elements(survey_id: str, ids: list[str], include_attached_cables: bool = False, apply: bool = False) -> dict:
+    """Delete elements (uuid or name). ONLY when the user explicitly asked. Refuses if a cable path is attached to a device being deleted, unless those paths are listed too or include_attached_cables=true (so no cable is left dangling). Lists exactly what goes. Dry run unless apply=true; restore_backup undoes it."""
     d = C.survey(survey_id)
-    have = {e["id"] for e in d["elements"]}
-    missing = [i for i in ids if i not in have]
-    if missing:
-        return {"error": f"not found: {missing}"}
-    d["elements"] = [e for e in d["elements"] if e["id"] not in set(ids)]
+    if not ids:
+        return {"error": "ids is empty"}
+    gone = _resolve(d, ids)
+    idset = {e["id"] for e in gone}
+    touching = _cables_touching(d, idset)
+    if touching and not include_attached_cables:
+        return {"error": "these cable paths are attached to devices you are deleting and would be left dangling: " + ", ".join(str(c.get("name")) for c in touching)
+                + ". Add them to ids, or pass include_attached_cables=true."}
+    for c in touching:
+        gone.append(c)
+        idset.add(c["id"])
+    d["elements"] = [e for e in d["elements"] if e["id"] not in idset]
+    pal = _pal()
+    rows = [_brief(e, pal) for e in gone]
     if not apply:
-        return {"dry_run": True, "would_delete": ids}
-    return _commit(d, "delete_elements", {"deleted": len(ids)})
+        return {"dry_run": True, "would_delete": len(rows), "elements": rows}
+    return _commit(d, "delete_elements", {"deleted": len(rows), "elements": rows})
 
 
 # ---------------- colors + bulk attributes + BOM placement ----------------
@@ -439,10 +548,10 @@ def _hex(v):
 def _select(d, ids, element_id, name_prefix, model=""):
     if not (ids or element_id or name_prefix or model):
         raise SSError("give ids, element_id, name_prefix or model so I know which elements to change")
-    want = set(ids)
+    byref = {e["id"] for e in _resolve(d, ids)} if ids else None
     out = []
     for e in d.get("elements", []):
-        if want and e["id"] not in want and e.get("name") not in want and _a(e, 141) not in want:
+        if byref is not None and e["id"] not in byref:
             continue
         if element_id and e.get("element_id") != element_id:
             continue
@@ -645,13 +754,14 @@ def apply_placement(survey_id: str, assign: list[dict] = [], place: list[dict] =
     d = C.survey(survey_id)
     profs = {p["id"]: p for p in C.profiles()}
     pal = _pal()
-    byid = {e["id"]: e for e in d.get("elements", [])}
     done = []
+    if len({a.get("id") for a in assign}) != len(assign):
+        return {"error": "an element appears twice in assign"}
     for a in assign:
-        e = byid.get(a.get("id"))
+        e = _resolve(d, [a.get("id")])[0]
         p = profs.get(a.get("profile_id"))
-        if not e or not p:
-            return {"error": f"unknown element id or profile_id in assign: {a}"}
+        if not p:
+            return {"error": f"unknown profile_id in assign: {a}"}
         if e.get("element_id") != p["element_id"]:
             return {"error": f"{e.get('name')} is a different element type than preset {p['name']}"}
         keep = {271, 305, 532, 173}
@@ -664,7 +774,10 @@ def apply_placement(survey_id: str, assign: list[dict] = [], place: list[dict] =
         p = profs.get(pl.get("profile_id"))
         if not p:
             return {"error": f"unknown profile_id in place: {pl}"}
-        el = C.new_element(d, p["element_id"], pl["x"], pl["y"], pl.get("name"), {}, p)
+        x, y = _xy(pl)
+        if pl.get("name") and any(pl["name"] in (e.get("name"), _a(e, 141)) for e in d["elements"]):
+            return {"error": f"the name {pl['name']} is already used in this survey"}
+        el = C.new_element(d, p["element_id"], x, y, pl.get("name"), {}, p)
         d["elements"].append(el)
         done.append(el)
     if not done:
@@ -680,7 +793,7 @@ def apply_placement(survey_id: str, assign: list[dict] = [], place: list[dict] =
 @_guard
 def load_bom(path: str) -> dict:
     """Read a Salesforce BOM/quote export (.csv or .xlsx). Columns are auto-detected (Product Code/Part Number/SKU/Model, Description, Quantity, Manufacturer, Unit/List Price)."""
-    rows = Q.parse_bom(path)
+    rows = Q.parse_bom(str(_confine(path)))
     return {"rows": len(rows), "total_qty": sum(r["qty"] for r in rows), "items": rows}
 
 
@@ -713,22 +826,107 @@ def match_bom(path: str) -> dict:
     """Match each Salesforce BOM line to a saved System Surveyor preset by model/part number.
     Returns matched (profile_id, element_id ready for place_elements) and unmatched lines with fuzzy suggestions.
     Next step: look at render_plan, ask the user where each part goes, then place_elements."""
-    return _match(Q.parse_bom(path))
+    return _match(Q.parse_bom(str(_confine(path))))
 
 
 @mcp.tool()
 @_guard
 def render_plan(survey_id: str, grid: int = 100, labels: bool = True, highlight_missing_model: bool = False,
-                proposed: list[dict] = [], scale: float = 1.5) -> dict:
+                proposed: list[dict] = [], scale: float = 1.5, icon_colors: bool = True) -> dict:
     """Draw the floor plan with element markers + a coordinate grid to a PNG you can view (Read the returned path).
-    proposed: [{x, y, label}] draws red crosses for planned placements so the user can confirm positions."""
+    proposed: [{x, y, label}] draws red crosses for planned placements so the user can confirm positions. icon_colors=true draws each marker in the element's real icon color (set_colors), so a recolor can be checked visually."""
     d = C.survey(survey_id)
     if not d.get("floorplan_url"):
         return {"error": "survey has no floor plan image"}
+    scale = min(max(float(scale), 0.3), 3.0)
+    grid = 0 if not grid else min(max(int(grid), 20), 1000)
     out = OUT / f"plan_{survey_id}.png"
-    r = P.render(d, out, client=C, grid=grid, labels=labels, scale=scale, highlight_missing_model=highlight_missing_model, extra_points=proposed)
+    r = P.render(d, out, client=C, grid=grid, labels=labels, scale=scale, highlight_missing_model=highlight_missing_model, extra_points=proposed, icon_colors=icon_colors)
     r["image_link"] = _link(out)
     return r
+
+
+# ---------------- find / inspect / reconcile / export ----------------
+@mcp.tool()
+@_guard
+def find_elements(survey_id: str, query: str = "", element_id: int = 0, status: str = "", model: str = "", missing_model: bool = False,
+                  limit: int = 50, offset: int = 0) -> dict:
+    """Search a survey's elements. query matches name, type, manufacturer, model and label text; filter by element_id (type), status, model, or missing_model=true. Returns ids you can pass to the change tools. Read-only."""
+    d = C.survey(survey_id)
+    pal = _pal()
+    out = []
+    for e in d.get("elements", []):
+        if element_id and e.get("element_id") != element_id:
+            continue
+        if status and (_a(e, 138) or "").lower() != status.lower():
+            continue
+        if model and Q.norm(model) not in Q.norm(_a(e, 305)):
+            continue
+        if missing_model and _a(e, 305):
+            continue
+        row = _brief(e, pal)
+        hay = " ".join(str(row.get(k) or "") for k in ("name", "type", "manufacturer", "model", "label", "status")).lower()
+        if query and query.lower() not in hay:
+            continue
+        out.append(row)
+    return {"total": len(out), "elements": out[offset:offset + limit], "truncated": offset + limit < len(out)}
+
+
+@mcp.tool()
+@_guard
+def get_element(survey_id: str, id: str) -> dict:
+    """Everything stored on one element (uuid or name like FCAM-001): every attribute with its name, position, preset, cable connections. Use it to see exactly what is set before changing something. Read-only."""
+    d = C.survey(survey_id)
+    e = _resolve(d, [id])[0]
+    return {"id": e["id"], "name": e.get("name"), "type": _pal().get(e.get("element_id"), {}).get("name", e.get("element_id")),
+            "element_id": e.get("element_id"), "position": e.get("position"), "element_profile_id": e.get("element_profile_id"),
+            "connections": e.get("connections") or None, "accessories": len(e.get("accessories") or []),
+            "attributes": {f"{a['attribute_id']} {C.attr_name(a['attribute_id'])}": a.get("value") for a in e.get("attributes", []) if a.get("value") not in ("", None)}}
+
+
+@mcp.tool()
+@_guard
+def bom_diff(survey_id: str, items: list[dict]) -> dict:
+    """Compare a BOM (e.g. cpq_items / lines from a Salesforce quote: [{model|part, quantity}]) with what the survey says, by model number. Returns short (BOM wants more than the survey shows), over (survey shows more), only_in_bom, only_in_survey, and how many survey devices still have no model. Use this to reconcile a quote against a survey. Read-only."""
+    d = C.survey(survey_id)
+    q = Q.build_quote(d, _pal(), C.profiles())
+    have, label = collections.Counter(), {}
+    for l in q["lines"]:
+        if l["model"]:
+            have[Q.norm(l["model"])] += l["qty"]
+            label[Q.norm(l["model"])] = l["model"]
+    want = collections.Counter()
+    for i in items:
+        part = str(i.get("model") or i.get("part") or "").strip()
+        if part:
+            want[Q.norm(part)] += int(i.get("quantity") or i.get("qty") or 1)
+            label.setdefault(Q.norm(part), part)
+    short = [{"part": label[k], "bom": want[k], "survey": have.get(k, 0), "short_by": want[k] - have.get(k, 0)} for k in want if k in have and want[k] > have[k]]
+    over = [{"part": label[k], "bom": want[k], "survey": have[k], "over_by": have[k] - want[k]} for k in want if k in have and have[k] > want[k]]
+    unmodeled = sum(1 for e in d.get("elements", []) if e.get("element_id") != CABLE and not _a(e, 305))
+    return {"matches": sum(1 for k in want if have.get(k) == want[k]), "short": short, "over": over,
+            "only_in_bom": [{"part": label[k], "quantity": want[k]} for k in want if k not in have],
+            "only_in_survey": [{"part": label[k], "quantity": have[k]} for k in have if k not in want],
+            "survey_devices_without_model": unmodeled}
+
+
+@mcp.tool()
+@_guard
+def export_elements(survey_id: str) -> dict:
+    """Write an equipment schedule CSV of every element (ID, type, status, manufacturer, model, price, qty, hours, label, mount height, icon color, x, y) and return a download link. Read-only."""
+    d = C.survey(survey_id)
+    pal = _pal()
+    od = OUT / "quotes"
+    od.mkdir(parents=True, exist_ok=True)
+    p = od / (re.sub(r"[^\w\-]+", "_", d.get("title") or survey_id) + "_elements.csv")
+    with open(p, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["ID", "Type", "Status", "Manufacturer", "Model", "Price", "Qty", "Install hours", "Label", "Mount height", "Icon color", "X", "Y", "UUID"])
+        for e in d.get("elements", []):
+            pos = e.get("position") if isinstance(e.get("position"), dict) else {}
+            w.writerow([e.get("name"), pal.get(e.get("element_id"), {}).get("name", e.get("element_id")), _a(e, 138), _a(e, 271), _a(e, 305), _a(e, 532),
+                        _a(e, 531), _a(e, 533), _a(e, 173), _a(e, 167), _a(e, 530), round(pos.get("x", 0), 1) if pos else "", round(pos.get("y", 0), 1) if pos else "", e["id"]])
+    return {"rows": len(d.get("elements", [])), "path": str(p), "link": _link(p)}
 
 
 # ---------------- BOM + quote ----------------
@@ -755,7 +953,7 @@ def quote(survey_id: str, pricebook_path: str = "", labor_rate: float = DEF_LABO
     Cable = Cable Path length(+additional) x cable_per_ft; labor = Installation Hours x labor_rate.
     Defaults come from the LABOR_RATE, CABLE_PER_FT, MARKUP_PCT and TAX_PCT environment variables (labor_rate / cable_per_ft below 0 = leave unpriced). Equipment price is treated as cost and marked up by markup_pct (sell = cost x (1 + markup)). Pass other values to override. Writes <title>_quote.xlsx and a CSV of quote lines importable into a CRM/CPQ; returns totals + gaps."""
     d = C.survey(survey_id)
-    pb = Q.load_pricebook(pricebook_path) if pricebook_path else {}
+    pb = Q.load_pricebook(str(_confine(pricebook_path))) if pricebook_path else {}
     lr = labor_rate if labor_rate >= 0 else None
     cf = cable_per_ft if cable_per_ft >= 0 else None
     q = Q.build_quote(d, _pal(), C.profiles(), pb, lr, cf, markup_pct, tax_pct)
@@ -777,13 +975,16 @@ def quote(survey_id: str, pricebook_path: str = "", labor_rate: float = DEF_LABO
 def download_floorplan(survey_id: str, path: str = "") -> dict:
     """Save the raw floor-plan image to disk and return the path."""
     d = C.survey(survey_id)
-    url = d.get("floorplan_url") or d.get("preview_image")
+    url = d.get("floorplan_url")
     if not url:
         return {"error": "survey has no floor plan image"}
-    r = httpx.get(url, follow_redirects=True, timeout=60)
+    key = url.split("media/")[1] if "media/" in url else None
+    if not key:
+        return {"error": "floor plan URL is in an unexpected form"}
+    r = httpx.get(C.get("/storage/media/presign", params={"key": key})["url"], follow_redirects=True, timeout=60)
     r.raise_for_status()
     ext = "png" if "png" in r.headers.get("content-type", "") else "jpg"
-    p = Path(path or (OUT / f"floorplan_{survey_id}.{ext}"))
+    p = _confine(path) if path else OUT / f"floorplan_{survey_id}.{ext}"
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_bytes(r.content)
     return {"path": str(p), "bytes": len(r.content), "scale": d.get("floorplan_scale")}
@@ -793,7 +994,10 @@ def download_floorplan(survey_id: str, path: str = "") -> dict:
 @_guard
 def raw_get(path: str) -> dict:
     """Read-only GET against /v3 (e.g. /user). For exploring the API."""
-    return C.get(path if path.startswith("/") else "/" + path)
+    path = path if path.startswith("/") else "/" + path
+    if ".." in path or "//" in path or "@" in path:
+        return {"error": "not a valid API path"}
+    return C.get(path)
 
 
 @mcp.tool()
@@ -830,14 +1034,13 @@ def restore_backup(survey_id: str, backup: str, apply: bool = False) -> dict:
         return {"error": "backup not found for that survey (use list_backups)"}
     snap = json.loads(p.read_text())
     live = C.survey(survey_id)
-    a, b = {e["id"]: e for e in live.get("elements", [])}, {e["id"]: e for e in snap.get("elements", [])}
-    changed = [i for i in a if i in b and _norm_attrs(a[i]) != _norm_attrs(b[i])]
-    summary = {"would_remove": [a[i].get("name") for i in a if i not in b], "would_re_add": [b[i].get("name") for i in b if i not in a],
-               "would_revert_attributes_on": [a[i].get("name") for i in changed]}
+    df = _diff(live, snap)
+    summary = {"would_remove": [_nm(live, i) for i in df["removed"]], "would_re_add": [_nm(snap, i) for i in df["added"]],
+               "would_revert_changes_on": [_nm(live, i) for i in df["changed"]]}
     if not apply:
         return {"dry_run": True, **summary}
     snap["version"] = live.get("version")
-    return _commit(snap, "restore_backup", summary, force_count=len(changed) + len(summary["would_remove"]) + len(summary["would_re_add"]))
+    return _commit(snap, "restore_backup", summary, force_count=len(df["changed"]) + len(df["removed"]) + len(df["added"]))
 
 
 # ---------------- HTTP server ----------------
@@ -932,7 +1135,7 @@ async def _download(request):
     exp, sig = request.query_params.get("exp", "0"), request.query_params.get("sig", "")
     want = hmac.new(MCP_TOKEN.encode(), f"{name}|{exp}".encode(), hashlib.sha256).hexdigest()[:40]
     p = _find_file(name)
-    if not p or not hmac.compare_digest(sig, want) or int(exp or 0) < time.time():
+    if not exp.isdigit() or p is None or p.suffix.lower() not in (".png", ".jpg", ".xlsx", ".csv") or not hmac.compare_digest(sig, want) or int(exp) < time.time():
         return PlainTextResponse("not found", status_code=404)
     return FileResponse(p)
 

@@ -68,3 +68,53 @@ def test_lens_colors_roundtrip():
     e = el("m", 257, **{"633": '[{"color":"F8C309","angle":90},{"color":"E6003E","angle":90}]'})
     assert [l["color"] for l in S._lenses(e)] == ["F8C309", "E6003E"]
     assert S._lenses(el("x", 69)) is None
+
+
+def test_diff_counts_real_changes():
+    a = {"elements": [dict(el("a", 69, **{"305": "X"}), position={"x": 1, "y": 2}), el("b", 69), el("c", 69)]}
+    b = {"elements": [dict(el("a", 69, **{"305": "X"}), position={"x": 5, "y": 2}), el("b", 69, **{"305": "Y"}), el("d", 69)]}
+    df = S._diff(a, b)
+    assert sorted(df["changed"]) == ["a", "b"] and df["added"] == ["d"] and df["removed"] == ["c"]
+    assert S._diff(a, a) == {"changed": [], "added": [], "removed": []}
+
+
+def test_resolve_rejects_unknown_and_duplicates():
+    d = {"elements": [el("u1", 69, **{"141": "FCAM-001"}), el("u2", 69, **{"141": "FCAM-002"}), el("u3", 69, **{"141": "FCAM-002"})]}
+    assert S._resolve(d, ["FCAM-001"])[0]["id"] == "u1"
+    with pytest.raises(SSError):
+        S._resolve(d, ["FCAM-999"])
+    with pytest.raises(SSError):
+        S._resolve(d, ["FCAM-002"])
+
+
+def test_xy_validation():
+    assert S._xy({"x": "10", "y": 20.126}) == (10.0, 20.13)
+    for bad in ({"x": 1}, {"x": "a", "y": 1}, {"x": -1, "y": 1}, {"x": float("nan"), "y": 1}, {"x": 1, "y": 99999}):
+        with pytest.raises(SSError):
+            S._xy(bad)
+
+
+def test_cables_touching_finds_attached_paths():
+    cp = dict(el("cp", 65), connections={"start": {"id": "dev"}, "end": {"id": "other"}})
+    d = {"elements": [el("dev", 69), el("other", 69), cp, dict(el("cp2", 65), connections={})]}
+    assert [c["id"] for c in S._cables_touching(d, {"dev"})] == ["cp"]
+    assert S._cables_touching(d, {"dev", "cp"}) == []
+
+
+def test_guard_turns_bad_input_into_error_dict():
+    @S._guard
+    def boom(m):
+        return m["x"]
+    out = boom({})
+    assert "error" in out and "Nothing was changed" in out["error"]
+
+
+def test_confine_only_in_server_mode(monkeypatch):
+    monkeypatch.setattr(S, "HTTP_MODE", True)
+    with pytest.raises(SSError):
+        S._confine("/etc/passwd")
+    with pytest.raises(SSError):
+        S._confine("../../etc/passwd")
+    assert str(S._confine("x.csv")).startswith(str(S.OUT.resolve()))
+    monkeypatch.setattr(S, "HTTP_MODE", False)
+    assert str(S._confine("/etc/passwd")).endswith("passwd")

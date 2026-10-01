@@ -38,9 +38,9 @@ Everything that changes a survey is a **dry run unless `apply=true`**.
 
 | Group | Tools |
 |---|---|
-| Read | `list_sites`, `list_surveys`, `get_survey`, `survey_summary`, `survey_gaps`, `list_palette`, `list_profiles` (presets), `find_products`, `render_plan`, `download_floorplan`, `raw_get` |
+| Read | `list_sites`, `list_surveys`, `get_survey`, `find_elements`, `get_element`, `survey_summary`, `survey_gaps`, `list_palette`, `list_profiles` (presets), `find_products`, `render_plan` (draws real icon colors), `download_floorplan`, `export_elements` (equipment schedule CSV), `raw_get` |
 | Change a survey | `assign_models`, `set_colors`, `set_attributes`, `rename_elements`, `place_elements`, `move_elements`, `delete_elements` |
-| BOM and quote | `load_bom`, `match_parts`, `match_bom`, `bom`, `quote`, `propose_placement`, `apply_placement` |
+| BOM and quote | `load_bom`, `match_parts`, `match_bom`, `bom`, `bom_diff` (BOM vs survey by model), `quote`, `propose_placement`, `apply_placement` |
 | Safety and ops | `status`, `list_backups`, `restore_backup` |
 
 Highlights:
@@ -58,14 +58,14 @@ All writes go through one function, `_commit()` in `server.py`:
 2. **Dry run by default.** Each tool shows exactly what would change; nothing is saved without `apply=true`. The server `INSTRUCTIONS` tell the agent to show the dry run and wait for a yes.
 3. **Ownership.** The survey must be on this server's team **and** created by `OWNER_USER_ID`, or be listed in `WRITE_SURVEYS`. Coworkers' surveys are read-only here, even though the same login could technically edit them.
 4. **Claim respected.** If someone else has the survey claimed for editing, the save is refused. If the owner has it claimed, the claim is left in place (the web app is not kicked out of edit mode).
-5. **Size cap.** `MAX_ELEMENTS_PER_WRITE` (default 40) elements per save.
+5. **Size cap, measured for real.** `MAX_ELEMENTS_PER_WRITE` (default 40). The server diffs the document it is about to send against the live survey and counts what actually changes, rather than trusting the tool's own count. A save that changes nothing is skipped, and any save that would *remove* elements is refused unless the tool is `delete_elements` or `restore_backup`.
 6. **Concurrency check.** The live `version` is re-read and compared right before saving.
 7. **Snapshot first.** The full survey is written to `/data/backups/<id>-<timestamp>.json`.
 8. **Verify after.** The survey is re-read and compared to what was sent; the result reports `verified: true/false`.
 9. **Journal.** Every save is appended to `/data/journal.jsonl`.
 10. **Undo.** `restore_backup` puts a snapshot back (also dry-run first, also guarded and snapshotted).
 
-Selection tools (`set_colors`, `set_attributes`, `assign_models`) refuse to run without a scope (ids, element type, name prefix or model) so "change everything" can't happen by accident.
+Selection tools (`set_colors`, `set_attributes`, `assign_models`) refuse to run without a scope (ids, element type, name prefix or model) so "change everything" can't happen by accident. Elements can be named by uuid or ID (`FCAM-001`); an unknown or duplicated name is an error, never skipped silently. `move_elements` refuses cable paths (lines) and validates coordinates, `delete_elements` refuses to leave a cable path dangling, `place_elements` refuses name collisions, and the element ID (attributes 141/140) can only change through `rename_elements`. In server mode, file arguments are confined to the data folder and download links are limited to PNG/JPG/XLSX/CSV.
 
 The agent endpoint requires `Authorization: Bearer $MCP_TOKEN`. File links returned by the server (quotes, floor plan PNGs) are HMAC-signed with that token and expire after 24 hours.
 

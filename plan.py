@@ -23,7 +23,7 @@ def fetch_image_signed(client, doc):
     return Image.open(io.BytesIO(r.content)).convert("RGBA")
 
 
-def render(doc, out_path, client=None, grid=100, labels=True, scale=1.5, highlight_missing_model=False, extra_points=None):
+def render(doc, out_path, client=None, grid=100, labels=True, scale=1.5, highlight_missing_model=False, extra_points=None, icon_colors=True):
     """extra_points: [{x,y,label}] drawn as red crosses (proposed placements)."""
     img = fetch_image_signed(client, doc)
     W, H = img.size
@@ -47,6 +47,10 @@ def render(doc, out_path, client=None, grid=100, labels=True, scale=1.5, highlig
             continue
         x, y = p["x"] * scale, p["y"] * scale
         col = SYS_COLORS.get(e.get("systemtype_id"), "#888888")
+        if icon_colors:
+            ic = next((str(a.get("value") or "") for a in e.get("attributes", []) if a["attribute_id"] == 530), "")
+            if len(ic) == 6 and all(c in "0123456789abcdefABCDEF" for c in ic):
+                col = "#" + ic
         has_model = any(a["attribute_id"] == 305 and a.get("value") for a in e.get("attributes", []))
         r = 6
         outline = (0, 0, 0, 255) if has_model or not highlight_missing_model else (255, 0, 0, 255)
